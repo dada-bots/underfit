@@ -1,0 +1,224 @@
+{
+  "key": "sa3-sm-sfx",
+  "label": "SA3-small-SFX",
+  "description": "~530M, 120s, SAME-S encoder, T5-Gemma (SFX, ARC)",
+  "backend": "sat_dev",
+  "diffusion_objective": "rectified_flow",
+  "_comment_encoder_id": "Identifies the autoencoder family. Models with the same encoder_id share a latent space \u2014 datasets pre-encoded for one are reusable across all. Verified by pretransform weight equality.",
+  "encoder_id": "SAME-S",
+  "_comment_compatible_encoders": "Encoder ids whose datasets can train this model. SAME-S is a distillation of SAME-L, so latents are interchangeable in either direction.",
+  "compatible_encoders": [
+    "SAME-S",
+    "SAME-L"
+  ],
+  "encoder_canonical_model": "sa3-small",
+  "paths": {
+    "base_config": "{checkpoints_dir}/sa3-sm-sfx/base/model_config.json",
+    "base_ckpt": "{checkpoints_dir}/sa3-sm-sfx/base/model.safetensors",
+    "arc_config": "{checkpoints_dir}/sa3-sm-sfx/arc/model_config.json",
+    "arc_ckpt": "{checkpoints_dir}/sa3-sm-sfx/arc/model.safetensors"
+  },
+  "arc": {
+    "type": "full_model"
+  },
+  "training": {
+    "clip_duration": 120.74,
+    "latent_crop_length": 1300,
+    "seconds_total": 120
+  },
+  "ui": {
+    "show_in_finetune_dropdown": true,
+    "show_in_dataset_dropdown": true,
+    "vram": {
+      "base_fp32_mb": 6500,
+      "base_fp16_mb": 4000,
+      "act_per_latent_mb": 0.006,
+      "native_latents": 1300
+    },
+    "_comment_lora_aggregate": "Aggregate constants for VRAM estimation (number of LoRA layers and dim sums).",
+    "lora_aggregate": {
+      "n_layers": 192,
+      "ab_sum": 703268,
+      "fo_sum": 465144,
+      "fi_sum": 238124
+    },
+    "sequence": {
+      "length": 1300,
+      "ds_ratio": 4096,
+      "sample_rate": 44100
+    },
+    "_comment_module_structure": "Used by the per-layer chip renderer. Lists the LoRA-targetable module families.",
+    "module_structure": {
+      "transformer_modules": [
+        {
+          "label": "self_attn",
+          "pattern": "self_attn"
+        },
+        {
+          "label": "cross_attn",
+          "pattern": "cross_attn"
+        },
+        {
+          "label": "ff",
+          "pattern": ".ff."
+        }
+      ],
+      "n_blocks": 20,
+      "conditioning_modules": [
+        {
+          "label": "to_timestep_embed",
+          "pattern": "to_timestep_embed"
+        },
+        {
+          "label": "to_cond_embed",
+          "pattern": "to_cond_embed"
+        },
+        {
+          "label": "to_global_embed",
+          "pattern": "to_global_embed"
+        },
+        {
+          "label": "to_local_embed",
+          "pattern": "to_local_embed"
+        },
+        {
+          "label": "global_cond_embedder",
+          "pattern": "global_cond_embedder"
+        }
+      ],
+      "other_modules": [
+        {
+          "label": "project_in",
+          "pattern": "project_in"
+        },
+        {
+          "label": "project_out",
+          "pattern": "project_out"
+        },
+        {
+          "label": "preprocess_conv",
+          "pattern": "preprocess_conv"
+        },
+        {
+          "label": "postprocess_conv",
+          "pattern": "postprocess_conv"
+        }
+      ]
+    },
+    "_comment_lora_layer_template": "Per-layer LoRA target list, built once per model. prefix/suffix are fixed names; per_block expands across n_blocks with {i} substitution.",
+    "lora_layer_template": {
+      "prefix": [
+        {
+          "name": "model.to_timestep_embed.0",
+          "fi": 256,
+          "fo": 1024
+        },
+        {
+          "name": "model.to_timestep_embed.2",
+          "fi": 1024,
+          "fo": 1024
+        },
+        {
+          "name": "model.to_cond_embed.0",
+          "fi": 768,
+          "fo": 1024
+        },
+        {
+          "name": "model.to_cond_embed.2",
+          "fi": 1024,
+          "fo": 1024
+        },
+        {
+          "name": "model.to_global_embed.0",
+          "fi": 768,
+          "fo": 1024
+        },
+        {
+          "name": "model.to_global_embed.2",
+          "fi": 1024,
+          "fo": 1024
+        },
+        {
+          "name": "model.transformer.project_in",
+          "fi": 256,
+          "fo": 1024
+        },
+        {
+          "name": "model.transformer.global_cond_embedder.0",
+          "fi": 1024,
+          "fo": 1024
+        },
+        {
+          "name": "model.transformer.global_cond_embedder.2",
+          "fi": 1024,
+          "fo": 6144
+        }
+      ],
+      "per_block_prefix": "model.transformer.layers.{i}",
+      "per_block": [
+        {
+          "suffix": ".self_attn.to_qkv",
+          "fi": 1024,
+          "fo": 5120
+        },
+        {
+          "suffix": ".self_attn.to_out",
+          "fi": 1024,
+          "fo": 1024
+        },
+        {
+          "suffix": ".cross_attn.to_q",
+          "fi": 1024,
+          "fo": 2048
+        },
+        {
+          "suffix": ".cross_attn.to_kv",
+          "fi": 1024,
+          "fo": 3072
+        },
+        {
+          "suffix": ".cross_attn.to_out",
+          "fi": 1024,
+          "fo": 1024
+        },
+        {
+          "suffix": ".ff.ff.0.proj",
+          "fi": 1024,
+          "fo": 8192
+        },
+        {
+          "suffix": ".ff.ff.2",
+          "fi": 4096,
+          "fo": 1024
+        },
+        {
+          "suffix": ".to_local_embed.0",
+          "fi": 257,
+          "fo": 1024
+        },
+        {
+          "suffix": ".to_local_embed.2",
+          "fi": 1024,
+          "fo": 1024
+        }
+      ],
+      "suffix": [
+        {
+          "name": "model.transformer.project_out",
+          "fi": 1024,
+          "fo": 256
+        },
+        {
+          "name": "model.preprocess_conv",
+          "fi": 256,
+          "fo": 256
+        },
+        {
+          "name": "model.postprocess_conv",
+          "fi": 256,
+          "fo": 256
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,28 @@
+# ── Runtime user state ──────────────────────────────────────────────────
+# Everything in STATE_DIR is gitignored: runs, datasets, audio, checkpoint
+# symlinks, gradio logs, state JSONs. Defaults to <repo>/state/ — overridable
+# via UNDERFIT_STATE_DIR. If a user points STATE_DIR elsewhere, that location
+# isn't covered by .gitignore, but it's also outside the repo so git won't see
+# it anyway.
+state/
+
+# ── Editor / OS / build artifacts ───────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.tmp
+*.bak.*
+
+dist/
+build/
+*.egg-info/
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ── Internal-only docs & scripts (not part of the public release) ───────
+_internal/
+CLAUDE.md
+LEARNINGS.md

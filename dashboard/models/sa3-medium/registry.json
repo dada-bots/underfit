@@ -1,0 +1,221 @@
+{
+  "key": "sa3-medium",
+  "label": "SA3-medium",
+  "description": "~1.5B, 380s, SAME-L encoder, T5-Gemma (HF release)",
+  "backend": "sa3",
+  "diffusion_objective": "rectified_flow",
+  "encoder_id": "SAME-L",
+  "_comment_compatible_encoders": "Encoder ids whose datasets can train this model. SAME-S is a distillation of SAME-L, so latents are interchangeable in either direction.",
+  "compatible_encoders": [
+    "SAME-L",
+    "SAME-S"
+  ],
+  "encoder_canonical_model": "sa3",
+  "paths": {
+    "base_config": "{checkpoints_dir}/sa3-medium/base/model_config.json",
+    "base_ckpt": "{checkpoints_dir}/sa3-medium/base/model.safetensors",
+    "arc_config": "{checkpoints_dir}/sa3-medium/arc/model_config.json",
+    "arc_ckpt": "{checkpoints_dir}/sa3-medium/arc/model.safetensors"
+  },
+  "arc": {
+    "type": "full_model"
+  },
+  "training": {
+    "clip_duration": 380.4,
+    "latent_crop_length": 4096,
+    "seconds_total": 380
+  },
+  "ui": {
+    "show_in_finetune_dropdown": true,
+    "show_in_dataset_dropdown": true,
+    "vram": {
+      "base_fp32_mb": 11500,
+      "base_fp16_mb": 6670,
+      "act_per_latent_mb": 0.005,
+      "native_latents": 4096
+    },
+    "lora_aggregate": {
+      "n_layers": 229,
+      "ab_sum": 1294616,
+      "fo_sum": 870912,
+      "fi_sum": 423704
+    },
+    "sequence": {
+      "length": 4096,
+      "ds_ratio": 4096,
+      "sample_rate": 44100
+    },
+    "module_structure": {
+      "transformer_modules": [
+        {
+          "label": "self_attn",
+          "pattern": "self_attn"
+        },
+        {
+          "label": "cross_attn",
+          "pattern": "cross_attn"
+        },
+        {
+          "label": "ff",
+          "pattern": ".ff."
+        }
+      ],
+      "other_modules": [
+        {
+          "label": "project_in",
+          "pattern": "project_in"
+        },
+        {
+          "label": "project_out",
+          "pattern": "project_out"
+        },
+        {
+          "label": "preprocess_conv",
+          "pattern": "preprocess_conv"
+        },
+        {
+          "label": "postprocess_conv",
+          "pattern": "postprocess_conv"
+        }
+      ],
+      "n_blocks": 24,
+      "conditioning_modules": [
+        {
+          "label": "to_timestep_embed",
+          "pattern": "to_timestep_embed"
+        },
+        {
+          "label": "to_cond_embed",
+          "pattern": "to_cond_embed"
+        },
+        {
+          "label": "to_global_embed",
+          "pattern": "to_global_embed"
+        },
+        {
+          "label": "to_local_embed",
+          "pattern": "to_local_embed"
+        },
+        {
+          "label": "global_cond_embedder",
+          "pattern": "global_cond_embedder"
+        }
+      ]
+    },
+    "lora_layer_template": {
+      "prefix": [
+        {
+          "name": "model.to_timestep_embed.0",
+          "fi": 256,
+          "fo": 1536
+        },
+        {
+          "name": "model.to_timestep_embed.2",
+          "fi": 1536,
+          "fo": 1536
+        },
+        {
+          "name": "model.to_cond_embed.0",
+          "fi": 768,
+          "fo": 1536
+        },
+        {
+          "name": "model.to_cond_embed.2",
+          "fi": 1536,
+          "fo": 1536
+        },
+        {
+          "name": "model.to_global_embed.0",
+          "fi": 768,
+          "fo": 1536
+        },
+        {
+          "name": "model.to_global_embed.2",
+          "fi": 1536,
+          "fo": 1536
+        },
+        {
+          "name": "model.transformer.project_in",
+          "fi": 256,
+          "fo": 1536
+        },
+        {
+          "name": "model.transformer.global_cond_embedder.0",
+          "fi": 1536,
+          "fo": 1536
+        },
+        {
+          "name": "model.transformer.global_cond_embedder.2",
+          "fi": 1536,
+          "fo": 9216
+        }
+      ],
+      "per_block_prefix": "model.transformer.layers.{i}",
+      "per_block": [
+        {
+          "suffix": ".self_attn.to_qkv",
+          "fi": 1536,
+          "fo": 7680
+        },
+        {
+          "suffix": ".self_attn.to_out",
+          "fi": 1536,
+          "fo": 1536
+        },
+        {
+          "suffix": ".cross_attn.to_q",
+          "fi": 1536,
+          "fo": 3072
+        },
+        {
+          "suffix": ".cross_attn.to_kv",
+          "fi": 1536,
+          "fo": 4608
+        },
+        {
+          "suffix": ".cross_attn.to_out",
+          "fi": 1536,
+          "fo": 1536
+        },
+        {
+          "suffix": ".ff.ff.0.proj",
+          "fi": 1536,
+          "fo": 12288
+        },
+        {
+          "suffix": ".ff.ff.2",
+          "fi": 6144,
+          "fo": 1536
+        },
+        {
+          "suffix": ".to_local_embed.0",
+          "fi": 257,
+          "fo": 1536
+        },
+        {
+          "suffix": ".to_local_embed.2",
+          "fi": 1536,
+          "fo": 1536
+        }
+      ],
+      "n_blocks": 24,
+      "suffix": [
+        {
+          "name": "model.transformer.project_out",
+          "fi": 1536,
+          "fo": 256
+        },
+        {
+          "name": "model.preprocess_conv",
+          "fi": 256,
+          "fo": 256
+        },
+        {
+          "name": "model.postprocess_conv",
+          "fi": 256,
+          "fo": 256
+        }
+      ]
+    }
+  }
+}

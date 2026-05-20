@@ -1,0 +1,65 @@
+[project]
+name = "underfit"
+version = "0.1.0"
+description = "LoRA finetuning for Stable Audio models"
+readme = "README.md"
+# 3.10 only — sat_dev pins this hard; sa3 is happy with anything >= 3.10.
+# uv will auto-fetch a 3.10 interpreter if the system doesn't have one.
+requires-python = ">=3.10,<3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "CJ Carr", email = "cj@dadabots.com" },
+]
+keywords = ["audio", "diffusion", "lora", "stable-audio", "fine-tuning"]
+
+# Dependency manifest for `uv` (https://docs.astral.sh/uv/). This is NOT a
+# PyPI package — underfit runs directly from the git clone:
+#     git clone https://github.com/dada-bots/underfit && cd underfit
+#     ./install.sh
+#
+# The diffusion backend (stable-audio-tools or stable-audio-3) is intentionally
+# NOT listed here — `install.sh` runs the setup wizard which installs whichever
+# backend the user picks. underfit auto-detects which backend is present at
+# runtime, or honors UNDERFIT_BACKEND={sat_dev,sa3}.
+#
+# Pins below mirror the constraints both supported backends hard-pin (torch
+# 2.7.1 + cu126), so `uv pip install -e <backend>` is a no-op for these
+# packages instead of a downgrade. Bump together when both backends bump.
+dependencies = [
+  "torch==2.7.1",
+  "torchaudio==2.7.1",
+  "safetensors>=0.7.0",
+  "tqdm>=4.67.3",
+  "huggingface_hub>=1.7.1",
+  "numpy>=2.2.6",
+  "soundfile>=0.12",
+  "Pillow>=10",
+]
+
+[[tool.uv.index]]
+# Match sa3's explicit CUDA 12.6 index for torch+torchaudio. sat_dev doesn't
+# pin a CUDA suffix, so it'll happily use whatever cu126 wheels are already in
+# the venv after `uv sync`.
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+]
+torchaudio = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+]
+
+[project.urls]
+Homepage = "https://github.com/dada-bots/underfit"
+Repository = "https://github.com/dada-bots/underfit"
+Issues = "https://github.com/dada-bots/underfit/issues"
+
+[tool.uv]
+# underfit is run directly from the clone — `package = false` tells uv not
+# to build/install it as a wheel. `uv sync` just creates .venv and installs
+# the dependencies above.
+package = false
+required-version = ">=0.5"

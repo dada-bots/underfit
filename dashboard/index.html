@@ -8122,8 +8122,11 @@ function _startLbtPolling() {
   _fetchLbt();
 }
 
+let _lbtBusy = false;
 async function _fetchLbt() {
   if (!currentRunId) return;
+  if (_lbtBusy) return;  // prevent pile-up — file lives on slow Drive on Colab
+  _lbtBusy = true;
   try {
     const res = await fetch(`/api/loss_by_timestep?run_id=${encodeURIComponent(currentRunId)}`);
     const data = await res.json();
@@ -8133,7 +8136,9 @@ async function _fetchLbt() {
       document.getElementById('lbt-chart-section').style.display = '';
       _renderLbtChart();
     }
-  } catch (_) {}
+  } catch (_) {} finally {
+    _lbtBusy = false;
+  }
 }
 
 function _renderLbtChart() {

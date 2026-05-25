@@ -5905,27 +5905,38 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if n_entries == 0:
             return {}
 
-        # Check cache
+        # Cache hit (file unchanged) — return last result.
         cached = self._lbt_cache.get(run_id)
         if cached and cached["file_size"] == file_size:
             return cached["result"]
 
-        # Read entire file and process
         n_bins = self._NUM_SIGMA_BINS
         bin_width = 1.0 / n_bins
         smoothing = "ema"  # "ema" or "sliding"
         ema_alpha = 0.02
         sliding_window = 50
 
-        # Collect raw (step, loss) per bin
-        bin_raw = [[] for _ in range(n_bins)]
+        # Incremental: if we've parsed this file before and it only grew,
+        # seek past the cached bytes and parse just the new entries. On
+        # Colab the file is on Drive — reading just the new tail (typically
+        # a few KB per poll) instead of the whole file (hundreds of KB
+        # during a long run) is the difference between snappy and pile-up.
+        if cached and cached["file_size"] < file_size and "bin_raw" in cached:
+            bin_raw = cached["bin_raw"]
+            read_from = cached["file_size"]
+        else:
+            bin_raw = [[] for _ in range(n_bins)]
+            read_from = 0
 
         try:
             with open(lbt_path, "rb") as f:
-                data = f.read()
-            for i in range(n_entries):
+                if read_from:
+                    f.seek(read_from)
+                new_data = f.read()
+            new_entries = len(new_data) // entry_size
+            for i in range(new_entries):
                 offset = i * entry_size
-                step, t_val, loss_val = struct.unpack_from("Iff", data, offset)
+                step, t_val, loss_val = struct.unpack_from("Iff", new_data, offset)
                 bin_idx = min(int(t_val / bin_width), n_bins - 1)
                 if bin_idx < 0:
                     bin_idx = 0
@@ -6001,7 +6012,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "total_entries": n_entries,
         }
 
-        self._lbt_cache[run_id] = {"file_size": file_size, "result": result}
+        # bin_raw stays in the cache so the next call can append-only.
+        self._lbt_cache[run_id] = {
+            "file_size": file_size,
+            "result": result,
+            "bin_raw": bin_raw,
+        }
         return result
 
     def _get_checkpoints(self, run_id=None):

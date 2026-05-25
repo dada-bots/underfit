@@ -5242,14 +5242,28 @@ function _loraFreezableIds() {
 }
 
 function _setLoraFrozen(frozen) {
+  // LoRA type/Rank/Alpha/include/exclude — disabled + heavily dimmed so the
+  // values stay visible (for verification) but obviously not editable.
   for (const id of _loraFreezableIds()) {
     const el = document.getElementById(id);
     if (!el) continue;
     el.disabled = frozen;
-    el.style.opacity = frozen ? '0.6' : '';
+    el.style.opacity = frozen ? '0.35' : '';
   }
+  // Layer filter — collapse it, mute it harder, swallow clicks. We don't
+  // want the user fiddling with the chips because the seed file already
+  // baked in include/exclude.
   const lf = document.getElementById('new-ft-layer-filter');
-  if (lf) lf.style.opacity = frozen ? '0.6' : '';
+  if (lf) {
+    if (frozen) {
+      lf.removeAttribute('open');
+      lf.style.opacity = '0.25';
+      lf.style.pointerEvents = 'none';
+    } else {
+      lf.style.opacity = '';
+      lf.style.pointerEvents = '';
+    }
+  }
 }
 
 function _showSeedUploadModal(filename, sizeMb) {
@@ -5350,7 +5364,7 @@ window.handleSeedLoraFile = async function(ev) {
   const stepHint = cfg.step ? ` · step ${cfg.step}` : '';
   const status = document.getElementById('new-ft-seed-status');
   status.innerHTML = `<span style="color:var(--green)">✓ ${data.filename}</span>` +
-    `<span style="color:var(--text2)"> · ${cfg.adapter_type} rank ${cfg.rank}${stepHint}</span> ` +
+    `<span style="color:var(--text2)">${stepHint}</span> ` +
     `<a href="#" onclick="event.preventDefault();_clearSeedLora();return false;" ` +
     `style="color:#9af;font-size:0.9em">[clear]</a>`;
   validateNewFt();

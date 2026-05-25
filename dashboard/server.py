@@ -54,6 +54,9 @@ SEED_LORAS_DIR = Path(os.environ.get("UNDERFIT_SEED_LORAS_DIR",
 # Outside Colab, defaults to RUNS_DIR so single-machine setups behave as before.
 LOGS_DIR = Path(os.environ.get("UNDERFIT_LOGS_DIR", str(RUNS_DIR))).expanduser()
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+# The dashboard's own stdout/stderr is teed here at startup so we can serve
+# it via /api/server_log. Truncated on every dashboard start.
+SERVER_LOG_FILE = LOGS_DIR / "dashboard_server.log"
 # Small state files (runs.json, datasets.json, gradio_*.json) live here.
 # On Colab → /content/underfit-state (local SSD) for instant dashboard reads.
 # Outside Colab → defaults to STATE_DIR so non-Colab setups are unchanged.
@@ -2925,6 +2928,31 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         elif path == "/api/log_tail":
             client_file_size = int(params.get("file_size", [0])[0])
             self._json_response(self._get_log_tail(run_id, file_size=client_file_size))
+        elif path == "/api/server_log":
+            try:
+                p = SERVER_LOG_FILE
+                if not p.exists():
+                    self._json_response({"log": "", "mtime": 0, "size": 0})
+                    return
+                # Tail the last ~128 KB to keep the response light; dashboard
+                # logs can grow over a long-running session.
+                MAX = 128 * 1024
+                with open(p, "rb") as f:
+                    f.seek(0, 2); size = f.tell()
+                    f.seek(max(0, size - MAX))
+                    raw = f.read()
+                # Drop first partial line if we read from the middle
+                if size > MAX:
+                    nl = raw.find(b"\n")
+                    if nl >= 0:
+                        raw = raw[nl + 1:]
+                self._json_response({
+                    "log": raw.decode("utf-8", errors="replace"),
+                    "mtime": p.stat().st_mtime,
+                    "size": size,
+                })
+            except Exception as e:
+                self._json_response({"error": str(e)}, status=500)
         elif path == "/api/clone_settings":
             self._json_response(self._get_clone_settings(run_id))
         elif path == "/api/loss_by_timestep":
@@ -6152,9 +6180,48 @@ def _resolve_backend_name():
             "Run .venv/bin/underfit-setup to install one.")
 
 
+class _Tee:
+    """Write to two streams (terminal + log file). Line-buffered enough that
+    the file is readable while the dashboard is still running."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+def _tee_stdio_to_server_log():
+    """Mirror stdout + stderr into SERVER_LOG_FILE so the dashboard can serve
+    its own log via /api/server_log. Truncates the file at startup so each
+    fresh dashboard launch starts clean (the file is diagnostic, not durable)."""
+    try:
+        SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        f = open(SERVER_LOG_FILE, "w", buffering=1)  # line-buffered
+    except OSError as e:
+        print(f"(could not open server log {SERVER_LOG_FILE}: {e})", flush=True)
+        return
+    sys.stdout = _Tee(sys.__stdout__, f)
+    sys.stderr = _Tee(sys.__stderr__, f)
+
+
 if __name__ == "__main__":
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     (AUDIO_DIR / "runs").mkdir(parents=True, exist_ok=True)
+    _tee_stdio_to_server_log()
     print(f"Backend: {_resolve_backend_name()}", flush=True)
     # Warm up nvidia-smi BEFORE the HTTP server starts accepting requests.
     # First nvidia-smi call on a fresh Colab VM can take 5–10 s while the

@@ -1561,8 +1561,9 @@
     <div class="glog-body">
       <div class="glog-left">
         <div class="glog-sort">
+          <button class="glog-sort-btn" id="glog-tab-server"   onclick="switchLogTab('server')"   style="flex:1">SERVER</button>
           <button class="glog-sort-btn" id="glog-tab-training" onclick="switchLogTab('training')" style="flex:1">TRAINING</button>
-          <button class="glog-sort-btn" id="glog-tab-gradio" onclick="switchLogTab('gradio')" style="flex:1">GRADIO</button>
+          <button class="glog-sort-btn" id="glog-tab-gradio"   onclick="switchLogTab('gradio')"   style="flex:1">GRADIO</button>
         </div>
         <div class="glog-list" id="glog-list"></div>
       </div>
@@ -7515,8 +7516,10 @@ function _renderGradioLogList() {
 }
 
 function _updateLogTabStyles() {
+  const sBtn = document.getElementById('glog-tab-server');
   const tBtn = document.getElementById('glog-tab-training');
   const gBtn = document.getElementById('glog-tab-gradio');
+  if (sBtn) sBtn.classList.toggle('active', _glogTab === 'server');
   tBtn.classList.toggle('active', _glogTab === 'training');
   gBtn.classList.remove('active');
   if (_glogTab === 'gradio') {
@@ -7529,6 +7532,10 @@ function _updateLogTabStyles() {
 function switchLogTab(tab) {
   _glogTab = tab;
   _updateLogTabStyles();
+  if (tab === 'server') {
+    _renderServerLogTab();
+    return;
+  }
   _renderLogList();
   // Auto-select first item
   const list = document.getElementById('glog-list');
@@ -7538,6 +7545,38 @@ function switchLogTab(tab) {
     _gradioLogSelectedId = null;
     document.getElementById('glog-header').textContent = _glogTab === 'training' ? 'No training runs' : 'No Gradio instances';
     document.getElementById('glog-pre').textContent = '';
+  }
+}
+
+// SERVER tab: there's only one log (the dashboard's own stdout/stderr), so
+// the left panel just shows a single "dashboard server" entry and the right
+// panel tails /api/server_log.
+async function _renderServerLogTab() {
+  const list = document.getElementById('glog-list');
+  list.innerHTML = `<div class="glog-item active" style="cursor:default">
+    <span class="status-dot training" style="width:8px;height:8px;flex-shrink:0"></span>
+    <div class="glog-item-info">
+      <div class="glog-item-title">dashboard server</div>
+      <div class="glog-item-meta"><span style="color:var(--green)">running</span></div>
+    </div>
+  </div>`;
+  _gradioLogSelectedId = '__server__';
+  const pre = document.getElementById('glog-pre');
+  const header = document.getElementById('glog-header');
+  header.textContent = 'dashboard_server.log (tail)';
+  pre.textContent = 'Loading...';
+  try {
+    const res = await fetch('/api/server_log');
+    const data = await res.json();
+    if (data.error) {
+      pre.textContent = 'Error: ' + data.error;
+      return;
+    }
+    _setLogContent(pre, data.log || '(empty)');
+    const viewer = document.getElementById('glog-viewer');
+    viewer.scrollTop = viewer.scrollHeight;
+  } catch (e) {
+    pre.textContent = 'Error loading server log: ' + e;
   }
 }
 
@@ -7786,6 +7825,20 @@ async function refreshGradioLog() {
   const wasAtBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 60;
 
   const tabAtRefreshStart = _glogTab;
+  if (tabAtRefreshStart === 'server') {
+    try {
+      const res = await fetch('/api/server_log');
+      if (_glogTab !== tabAtRefreshStart) return;
+      const data = await res.json();
+      if (data.log != null) {
+        _setLogContent(pre, data.log || '(empty)');
+        if (wasAtBottom) viewer.scrollTop = viewer.scrollHeight;
+      }
+    } catch (e) {
+      // Silent — keep showing the last good content.
+    }
+    return;
+  }
   if (tabAtRefreshStart === 'training') {
     // Refresh training log (incremental — send raw file_size, get only new bytes)
     try {

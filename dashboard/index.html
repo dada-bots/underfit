@@ -7602,22 +7602,54 @@ function _scheduleRefresh() {
 }
 _scheduleRefresh();
 
-// Fast log tail poller — 1s updates for console output
+// Fast log tail poller — 1s updates for console output.
+//
+// Three things matter to avoid request pile-up on slow Drive-backed logs:
+//   1. Send file_size so the server returns only new bytes (KB instead of MB).
+//   2. Busy flag — never fire a new fetch while the previous is in flight,
+//      otherwise on Colab Drive (~seconds/fetch) requests queue up until
+//      they hit Chrome's 6-conn-per-host cap and all stick at (pending).
+//   3. Reset state on run switch.
+let _mainLogText = '';
+let _mainLogFileSize = 0;
+let _mainLogLastRunId = null;
+let _mainLogBusy = false;
 setInterval(async () => {
   if (!currentRunId) return;
+  if (_mainLogBusy) return;
+  if (currentRunId !== _mainLogLastRunId) {
+    _mainLogText = '';
+    _mainLogFileSize = 0;
+    _mainLogLastRunId = currentRunId;
+  }
   const snapRunId = currentRunId;
+  const snapSize = _mainLogFileSize;
+  _mainLogBusy = true;
   try {
-    const res = await fetch(`/api/log_tail?run_id=${encodeURIComponent(snapRunId)}`);
+    const res = await fetch(`/api/log_tail?run_id=${encodeURIComponent(snapRunId)}&file_size=${snapSize}`);
     if (currentRunId !== snapRunId) return;
     const data = await res.json();
+    if (typeof data.file_size === 'number') _mainLogFileSize = data.file_size;
     if (data.log_tail) {
+      if (snapSize === 0) {
+        // Initial full read — replace.
+        _mainLogText = data.log_tail;
+      } else if (data.replace_last_line && _mainLogText) {
+        // Server re-read from previous newline; replace last partial line.
+        const lastNl = _mainLogText.lastIndexOf('\n');
+        _mainLogText = (lastNl >= 0 ? _mainLogText.substring(0, lastNl + 1) : '') + data.log_tail;
+      } else {
+        _mainLogText += data.log_tail;
+      }
       document.getElementById('log-section').style.display = '';
       const lc = document.getElementById('log-container');
       const wasAtBottom = lc.classList.contains('open') && lc.scrollHeight - lc.scrollTop - lc.clientHeight < 60;
-      _setLogContent(document.getElementById('log-content'), data.log_tail);
+      _setLogContent(document.getElementById('log-content'), _mainLogText);
       if (wasAtBottom) lc.scrollTop = lc.scrollHeight;
     }
-  } catch (_) {}
+  } catch (_) {} finally {
+    _mainLogBusy = false;
+  }
 }, 1000);
 
 window.addEventListener('resize', () => { chart.draw(); gradNormChart.draw(); loraMagChart.draw(); lrChart.draw(); });

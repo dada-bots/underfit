@@ -3400,8 +3400,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         inferred_models = []
         if not seed_base:
             # Build full per-model layer sets and check subset match.
+            # IMPORTANT: only compare 'model.*' keys. SA3 LoRAs may also
+            # include 'conditioner.*' entries (text encoder, etc.) which
+            # aren't enumerated in the registry's lora_layer_template — and
+            # that's expected. The diffusion-model layer set is the
+            # discriminative signal.
             seed_layers = result.get("layers") or []
-            seed_fingerprint = {(l["name"], l["fan_in"], l["fan_out"]) for l in seed_layers}
+            seed_fingerprint = {
+                (l["name"], l["fan_in"], l["fan_out"])
+                for l in seed_layers
+                if l["name"].startswith("model.")
+            }
             for mkey, minfo in MODELS_UI_PAYLOAD.items():
                 tmpl = minfo.get("lora_layer_template") or {}
                 ms = minfo.get("module_structure") or {}
@@ -3419,6 +3428,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 # LoRA fingerprint must be a SUBSET of the model's full layer set.
                 if seed_fingerprint and seed_fingerprint.issubset(model_set):
                     inferred_models.append(mkey)
+            # Also surface the seed's model.* layers for the popup (helps
+            # debug when neither metadata nor heuristic give a match).
+            result.setdefault("partial", {})["model_layer_count"] = len(seed_fingerprint)
 
         # Response shape
         response = {

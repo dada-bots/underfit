@@ -1446,17 +1446,10 @@
   </div>
 </div>
 
-<!-- Seed-LoRA upload progress popup (sits ABOVE the New Finetune modal while
-     a checkpoint streams up; closes itself on completion / error). -->
+<!-- Seed-LoRA upload modal — repurposed for progress, errors, and decisions.
+     The inner content is rebuilt by _showSeedProgress / _showSeedDialog. -->
 <div class="modal-overlay" id="seed-upload-modal" style="display:none;z-index:1000">
-  <div class="modal" style="max-width:420px;text-align:center;padding:20px 24px">
-    <div style="font-size:1.05em;font-weight:600;margin-bottom:6px">Uploading LoRA checkpoint</div>
-    <div id="seed-upload-filename" style="color:var(--text2);font-size:0.85em;word-break:break-all;margin-bottom:14px">filename.safetensors</div>
-    <div id="seed-upload-status" style="font-size:0.88em;color:var(--text1)">starting…</div>
-    <div style="width:100%;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;margin-top:14px;overflow:hidden">
-      <div id="seed-upload-bar" style="height:100%;width:0%;background:var(--accent2);transition:width 0.2s ease-out"></div>
-    </div>
-  </div>
+  <div class="modal" id="seed-modal-inner" style="max-width:480px;text-align:center;padding:20px 24px"></div>
 </div>
 
 <div class="modal-overlay" id="ds-modal" onclick="if(event.target===this)closeNewDatasetModal()">
@@ -5282,18 +5275,60 @@ function _setLoraFrozen(frozen) {
   }
 }
 
+// The seed-LoRA modal hosts three different layouts:
+//   progress — filename + status + bar (during upload)
+//   dialog   — title + body + buttons (errors, confirms, choices)
+// Both helpers rebuild #seed-modal-inner from scratch.
 function _showSeedUploadModal(filename, sizeMb) {
-  document.getElementById('seed-upload-filename').textContent = filename;
-  document.getElementById('seed-upload-status').textContent = `starting upload — ${sizeMb} MB`;
-  document.getElementById('seed-upload-bar').style.width = '0%';
+  const inner = document.getElementById('seed-modal-inner');
+  inner.innerHTML = `
+    <div style="font-size:1.05em;font-weight:600;margin-bottom:6px">Uploading LoRA checkpoint</div>
+    <div id="seed-upload-filename" style="color:var(--text2);font-size:0.85em;word-break:break-all;margin-bottom:14px">${filename}</div>
+    <div id="seed-upload-status" style="font-size:0.88em;color:var(--text1)">starting upload — ${sizeMb} MB</div>
+    <div style="width:100%;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;margin-top:14px;overflow:hidden">
+      <div id="seed-upload-bar" style="height:100%;width:0%;background:var(--accent2);transition:width 0.2s ease-out"></div>
+    </div>
+  `;
   document.getElementById('seed-upload-modal').style.display = 'flex';
 }
 function _updateSeedUploadModal(pct, statusText) {
-  document.getElementById('seed-upload-status').textContent = statusText;
-  if (pct != null) document.getElementById('seed-upload-bar').style.width = pct + '%';
+  const s = document.getElementById('seed-upload-status');
+  if (s) s.textContent = statusText;
+  const b = document.getElementById('seed-upload-bar');
+  if (b && pct != null) b.style.width = pct + '%';
 }
 function _hideSeedUploadModal() {
   document.getElementById('seed-upload-modal').style.display = 'none';
+}
+
+// Show a dialog inside the seed modal — title, HTML body, and N buttons.
+// Each button: {label, primary?, onClick}. The modal hides automatically
+// when any button is clicked; onClick is invoked after hide.
+function _showSeedDialog(title, bodyHtml, buttons) {
+  const inner = document.getElementById('seed-modal-inner');
+  inner.innerHTML = `
+    <div style="font-size:1.05em;font-weight:600;margin-bottom:10px">${title}</div>
+    <div style="margin-bottom:14px;font-size:0.88em;line-height:1.45;color:var(--text1);text-align:left">${bodyHtml}</div>
+    <div id="seed-dialog-buttons" style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap"></div>
+  `;
+  const row = inner.querySelector('#seed-dialog-buttons');
+  buttons.forEach((b) => {
+    const el = document.createElement('button');
+    el.className = b.primary ? 'modal-launch' : 'modal-cancel';
+    el.style.cssText = 'padding:6px 18px;font-size:0.88em';
+    el.textContent = b.label;
+    el.onclick = () => {
+      _hideSeedUploadModal();
+      if (typeof b.onClick === 'function') b.onClick();
+    };
+    row.appendChild(el);
+  });
+  document.getElementById('seed-upload-modal').style.display = 'flex';
+}
+
+function _escAttr(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function _clearSeedLora() {
@@ -5354,15 +5389,18 @@ window.handleSeedLoraFile = async function(ev) {
   _hideSeedUploadModal();
 
   if (!data.ok) {
-    const lines = ['Unable to validate .safetensors checkpoint.'];
-    if (data.error) lines.push('', 'Error: ' + data.error);
+    let bodyHtml = data.error
+      ? `<div style="color:var(--red);margin-bottom:8px">${_escAttr(data.error)}</div>`
+      : '';
     if (data.partial && Object.keys(data.partial).length) {
-      lines.push('', 'What we did manage to extract:');
+      bodyHtml += '<div style="color:var(--text2);font-size:0.82em;margin-top:6px"><b>Diagnostic info:</b><br>';
       for (const [k, v] of Object.entries(data.partial)) {
-        lines.push(`  ${k}: ${JSON.stringify(v)}`);
+        bodyHtml += `&nbsp;${_escAttr(k)}: <code>${_escAttr(JSON.stringify(v).slice(0, 200))}</code><br>`;
       }
+      bodyHtml += '</div>';
     }
-    alert(lines.join('\n'));
+    _showSeedDialog('Unable to validate .safetensors checkpoint', bodyHtml,
+      [{label: 'Close', primary: false}]);
     return;
   }
 
@@ -5371,69 +5409,87 @@ window.handleSeedLoraFile = async function(ev) {
   const seedBase = data.base_model_in_seed;        // string or null
   const seedBaseKnown = !!data.base_model_known;   // is seedBase in our registry?
   const inferred = data.inferred_base_models || [];
+  const known = Object.keys(_remoteModels).join(', ');
+
+  // Helper to apply the seed once base-model is settled.
+  function _commitSeed() {
+    document.getElementById('new-ft-seed-path').value = data.path;
+    document.getElementById('new-ft-seed-filename').value = data.filename;
+    document.getElementById('new-ft-seed-step').value = (data.config && data.config.step) || 0;
+    const cfg = data.config || {};
+    if (cfg.adapter_type) document.getElementById('new-ft-lora-type').value = cfg.adapter_type;
+    if (cfg.rank != null) document.getElementById('new-ft-rank').value = cfg.rank;
+    if (cfg.alpha != null) document.getElementById('new-ft-alpha').value = cfg.alpha;
+    if (Array.isArray(cfg.include)) document.getElementById('new-ft-include').value = cfg.include.join(',');
+    if (Array.isArray(cfg.exclude)) document.getElementById('new-ft-exclude').value = cfg.exclude.join(',');
+    _setLoraFrozen(true);
+    document.getElementById('new-ft-lora-load-btn').style.display = 'none';
+    const status = document.getElementById('new-ft-seed-status');
+    status.innerHTML = `<span style="color:var(--green)">✓ ${_escAttr(data.filename)}</span> ` +
+      `<a href="#" onclick="event.preventDefault();_clearSeedLora();return false;" ` +
+      `style="color:#9af;font-size:0.9em">[clear]</a>`;
+    validateNewFt();
+    updateCkptEstimate();
+  }
+  function _switchBaseTo(modelKey) {
+    document.getElementById('new-ft-base-model').value = modelKey;
+    _applyDefaultExclusions(); filterNewFtDatasets(); renderModuleChips();
+    updateCkptEstimate(); _updateCropLength();
+  }
 
   if (seedBase) {
     if (!seedBaseKnown) {
-      alert(`This LoRA was trained from base model '${seedBase}', `
-            + `but that model isn't loaded in this dashboard. Add the `
-            + `'${seedBase}' model to the dashboard, or use a LoRA whose `
-            + `base model is one of: ${Object.keys(_remoteModels).join(', ')}`);
+      _showSeedDialog(
+        'Base model not loaded',
+        `This LoRA was trained from base model <b>${_escAttr(seedBase)}</b>, `
+        + `but that model isn't loaded in this dashboard.<br><br>`
+        + `Add <code>${_escAttr(seedBase)}</code> to the dashboard (re-run `
+        + `<code>underfit-setup --models ${_escAttr(seedBase)}</code>), `
+        + `or upload a LoRA whose base model is one of: <code>${_escAttr(known)}</code>.`,
+        [{label: 'Close'}]);
       return;
     }
     if (seedBase !== currentBase) {
-      const switchTo = confirm(
-        `This LoRA was trained from base model '${seedBase}', `
-        + `but you've selected '${currentBase}'. Switch to '${seedBase}'?\n\n`
-        + `OK to switch, Cancel to abort the upload.`);
-      if (!switchTo) return;
-      document.getElementById('new-ft-base-model').value = seedBase;
-      // Trigger the same side-effects the dropdown's onchange does.
-      _applyDefaultExclusions(); filterNewFtDatasets(); renderModuleChips();
-      updateCkptEstimate(); _updateCropLength();
-    }
-  } else if (inferred.length === 0) {
-    alert("This LoRA doesn't seem to fit with any base model loaded in this dashboard. "
-          + 'Its layer dimensions match none of: '
-          + Object.keys(_remoteModels).join(', '));
-    return;
-  } else {
-    // No base_model in metadata, but heuristic produced candidates.
-    const listed = inferred.join(', ');
-    const choice = prompt(
-      `This LoRA was trained with an unknown base model (no metadata).\n`
-      + `Possible compatible models in this dashboard: ${listed}\n\n`
-      + `Type the exact model key to use, or Cancel to abort:`,
-      inferred[0]);
-    if (!choice) return;
-    if (!inferred.includes(choice)) {
-      alert(`'${choice}' isn't one of the suggested matches: ${listed}`);
+      _showSeedDialog(
+        'Switch base model?',
+        `This LoRA was trained from <b>${_escAttr(seedBase)}</b>, `
+        + `but you've selected <b>${_escAttr(currentBase)}</b>.<br><br>`
+        + `Switch to <b>${_escAttr(seedBase)}</b> and continue?`,
+        [
+          {label: 'Switch', primary: true,
+           onClick: () => { _switchBaseTo(seedBase); _commitSeed(); }},
+          {label: 'Cancel'},
+        ]);
       return;
     }
-    if (choice !== currentBase) {
-      document.getElementById('new-ft-base-model').value = choice;
-      _applyDefaultExclusions(); filterNewFtDatasets(); renderModuleChips();
-      updateCkptEstimate(); _updateCropLength();
-    }
+    // Same base — proceed.
+    _commitSeed();
+    return;
   }
 
-  // Success — populate fields, freeze, hide the load button, show filename + [clear].
-  document.getElementById('new-ft-seed-path').value = data.path;
-  document.getElementById('new-ft-seed-filename').value = data.filename;
-  document.getElementById('new-ft-seed-step').value = (data.config && data.config.step) || 0;
-  const cfg = data.config || {};
-  if (cfg.adapter_type) document.getElementById('new-ft-lora-type').value = cfg.adapter_type;
-  if (cfg.rank != null) document.getElementById('new-ft-rank').value = cfg.rank;
-  if (cfg.alpha != null) document.getElementById('new-ft-alpha').value = cfg.alpha;
-  if (Array.isArray(cfg.include)) document.getElementById('new-ft-include').value = cfg.include.join(',');
-  if (Array.isArray(cfg.exclude)) document.getElementById('new-ft-exclude').value = cfg.exclude.join(',');
-  _setLoraFrozen(true);
-  document.getElementById('new-ft-lora-load-btn').style.display = 'none';
-  const status = document.getElementById('new-ft-seed-status');
-  status.innerHTML = `<span style="color:var(--green)">✓ ${data.filename}</span> ` +
-    `<a href="#" onclick="event.preventDefault();_clearSeedLora();return false;" ` +
-    `style="color:#9af;font-size:0.9em">[clear]</a>`;
-  validateNewFt();
-  updateCkptEstimate();
+  // No base_model in metadata.
+  if (inferred.length === 0) {
+    _showSeedDialog(
+      'Incompatible LoRA',
+      `This LoRA doesn't seem to fit any base model loaded in this dashboard.<br><br>`
+      + `Its layer dimensions don't match any of: <code>${_escAttr(known)}</code>.`,
+      [{label: 'Close'}]);
+    return;
+  }
+  // Heuristic produced candidates — let the user pick one.
+  const choiceBtns = inferred.map((m) => ({
+    label: m, primary: (m === currentBase),
+    onClick: () => {
+      if (m !== currentBase) _switchBaseTo(m);
+      _commitSeed();
+    },
+  }));
+  choiceBtns.push({label: 'Cancel'});
+  _showSeedDialog(
+    'Pick a base model',
+    `This LoRA was trained with an unknown base model (no metadata).<br><br>`
+    + `Layer dimensions match these models — pick the one this LoRA came from:`,
+    choiceBtns);
 };
 
 function updateCkptEstimate() {

@@ -5,6 +5,8 @@ Thin wrapper around underfit.training.run_training. The training loop is
 backend-agnostic (sat_dev or sa3) and lives in underfit/training/loop.py.
 """
 import os
+import sys
+import traceback
 print(f"Starting {os.path.basename(__file__)}...", flush=True)
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -13,6 +15,28 @@ import configparser
 
 from underfit.backends import get_backend
 from underfit.training import run_training
+
+
+def _dump_exit_reason(exc):
+    """Write the unhandled exception's traceback to <log>.exit so the dashboard
+    can surface it as a kill_hint even when the stdout/tee pipe got truncated
+    (segfault, OOM-kill of a child, etc.). UNDERFIT_LOG_PATH is set by the
+    dashboard launcher; falls back to a cwd-relative file otherwise."""
+    log_path = os.environ.get("UNDERFIT_LOG_PATH") or "lora_train.log"
+    exit_path = log_path + ".exit"
+    try:
+        with open(exit_path, "w") as f:
+            f.write(f"lora_train.py exited with {type(exc).__name__}: {exc}\n\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
+    except Exception:
+        pass
+    # Also re-print to stderr in case the pipe is still alive.
+    try:
+        sys.stderr.write(f"\n=== lora_train.py exited with {type(exc).__name__}: {exc} ===\n")
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def get_all_args(defaults_file="defaults.ini"):
@@ -67,4 +91,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as _exc:
+        _dump_exit_reason(_exc)
+        sys.exit(1)

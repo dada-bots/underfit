@@ -99,8 +99,10 @@ def _disks() -> list[dict]:
 
 def _latest_run_log(runs: list[dict]) -> dict | None:
     """Pick the run whose log file mtime is most recent. None if no run has
-    a readable log on disk."""
+    a readable log on disk. Carries kill_hint when the dashboard set one
+    (run died fast — likely OOM/CUDA error/shell-fail)."""
     best = None
+    best_run = None
     for r in runs:
         lp = r.get("log_path")
         if not lp:
@@ -116,6 +118,12 @@ def _latest_run_log(runs: list[dict]) -> dict | None:
                 "mtime": mt,
                 "status": r.get("status", "?"),
             }
+            best_run = r
+    if best is not None and best_run is not None:
+        if best_run.get("kill_hint"):
+            best["kill_hint"] = best_run["kill_hint"]
+        if best_run.get("error"):
+            best["error"] = best_run["error"]
     return best
 
 
@@ -218,9 +226,15 @@ def format_text(data: dict[str, Any]) -> str:
         parts.append(f"{d['label']}: {d['used_gb']:.1f}/{d['total_gb']:.1f} GB ({d['pct']:.0f}%){warn}")
     out = " | ".join(parts)
     log = data.get("latest_run_log")
-    if log and log.get("tail"):
-        out += f"\n  📜 {log['name']} ({os.path.basename(log['path'])})"
-        for line in log["tail"]:
+    if log:
+        status = log.get("status", "")
+        header = f"\n  📜 {log['name']} [{status}] ({os.path.basename(log['path'])})"
+        if log.get("kill_hint"):
+            header += f"\n     ⚠ {log['kill_hint']}"
+        if log.get("error"):
+            header += f"\n     error: {log['error']}"
+        out += header
+        for line in log.get("tail", []) or []:
             out += f"\n     {line}"
     return out
 
@@ -261,14 +275,24 @@ def format_html(data: dict[str, Any]) -> str:
             f"({d['pct']:4.1f}%){warn}</span>"
         )
     log = data.get("latest_run_log")
-    if log and log.get("tail"):
+    if log:
         lines.append("")
+        status = log.get("status", "")
         lines.append(
             f"<span style='color:#888'>📜 <b>{_html.escape(str(log['name']))}</b> "
+            f"<span style='color:#aaa'>[{_html.escape(status)}]</span> "
             f"<span style='color:#666'>({_html.escape(os.path.basename(log['path']))})"
             f"</span></span>"
         )
-        for line in log["tail"]:
+        if log.get("kill_hint"):
+            lines.append(
+                f"   <span style='color:#fa6'>⚠ {_html.escape(str(log['kill_hint']))}</span>"
+            )
+        if log.get("error"):
+            lines.append(
+                f"   <span style='color:#e66'>error: {_html.escape(str(log['error']))}</span>"
+            )
+        for line in log.get("tail", []) or []:
             lines.append(f"   <span style='color:#aaa'>{_html.escape(line)}</span>")
     return ("<pre style='margin:0;font-family:monospace;line-height:1.4;"
             "white-space:pre-wrap;word-break:break-word'>"

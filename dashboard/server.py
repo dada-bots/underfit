@@ -351,31 +351,43 @@ def _free_gpu_memory(gpu):
 
 
 def _diagnose_quick_kill(run: dict) -> str | None:
-    """If a run died within 30 s with little/no log output, return a one-line
-    hint about the likely cause. None if the run is healthy or died later.
+    """Return a one-line hint about why a run died, or None if no signal.
 
-    Checks (in order of usefulness):
-      1. `<log>.bash.err` — captures shell-level errors before the pipe (rare
-         but extremely useful: source-failures, syntax errors, etc.).
-      2. Elapsed time vs first/last log writes — short death + empty log
-         strongly suggests SIGKILL (OOM), since Python tracebacks would have
-         landed before the kernel pulls the plug.
+    Checks in priority order:
+      1. `<log>.exit` — written by lora_train.py's global try/except. Has the
+         actual Python exception + traceback, robust to pipe/buffering issues.
+      2. `<log>.bash.err` — bash's own stderr (source-failures, shell syntax,
+         etc.). Rare but extremely useful when it fires.
+      3. Elapsed <30 s + tiny log → SIGKILL (OOM-killer) heuristic.
     """
     log_path = run.get("log_path") or ""
+
+    # 1. Python exit sidecar (highest signal)
+    exit_path = log_path + ".exit"
+    if os.path.exists(exit_path):
+        try:
+            with open(exit_path, "rb") as f:
+                exit_txt = f.read(4096).decode("utf-8", errors="replace").strip()
+            first = exit_txt.splitlines()[0][:250] if exit_txt else ""
+            if first:
+                return first
+
+        except OSError:
+            pass
+
+    # 2. Bash-level error
     bash_err = log_path + ".bash.err"
-    bash_err_txt = ""
     if os.path.exists(bash_err):
         try:
             with open(bash_err, "rb") as f:
                 bash_err_txt = f.read(2048).decode("utf-8", errors="replace").strip()
+            if bash_err_txt:
+                first_line = bash_err_txt.splitlines()[0][:200]
+                return f"Shell error before training started: {first_line}"
         except OSError:
             pass
-    # Always surface bash-level errors — they're never normal.
-    if bash_err_txt:
-        first_line = bash_err_txt.splitlines()[0][:200]
-        return f"Shell error before training started: {first_line}"
 
-    # Elapsed time since launch
+    # 3. Quick death with empty log → OOM-killer heuristic
     elapsed = None
     try:
         ts = run.get("created_at", "")
@@ -383,15 +395,12 @@ def _diagnose_quick_kill(run: dict) -> str | None:
             elapsed = time.time() - datetime.fromisoformat(ts).timestamp()
     except Exception:
         pass
-
-    # Log size — if there's substantive output, no hint needed; the user can read the log
     log_size = 0
     if log_path:
         try:
             log_size = os.path.getsize(log_path)
         except OSError:
             pass
-
     if elapsed is not None and elapsed < 30 and log_size < 200:
         return ("Process died in <30 s with no output — almost certainly SIGKILL "
                 "from the kernel OOM-killer. Check `dmesg | tail` for "
@@ -3461,7 +3470,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "NUMEXPR_NUM_THREADS=4 RAYON_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false "
         ) if GRADIO_THREAD_CAP else ""
         backend_env = _backend_env_for_model(base_model)
-        launch_cmd = f"source {VENV_ACTIVATE} && cd {_q(demo_dir)} && PYTHONUNBUFFERED=1 {backend_env}{thread_env}{gpu_env}{restart_cmd} 2>&1 | python3 -u -m underfit.utils.stderr_filter | tee {_q(log_path)}"
+        # UNDERFIT_LOG_PATH lets lora_train.py write a sidecar <log>.exit on
+        # any unhandled exception — robust to pipe/buffering issues that can
+        # cause the normal tee'd log to come out empty.
+        log_env = f"UNDERFIT_LOG_PATH={_q(log_path)} "
+        launch_cmd = f"source {VENV_ACTIVATE} && cd {_q(demo_dir)} && PYTHONUNBUFFERED=1 {log_env}{backend_env}{thread_env}{gpu_env}{restart_cmd} 2>&1 | python3 -u -m underfit.utils.stderr_filter | tee {_q(log_path)}"
         # Capture bash's own stderr (shell errors, source failures, etc.) — used by
         # the run-monitor's diagnose helper to surface a hint when a run dies fast
         # with an empty log.

@@ -4901,11 +4901,26 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not name or not input_dir:
             self._json_response({"error": "name and input_dir required"}, status=400)
             return
-        # Ensure dataset name (slug) is unique
-        for existing in datasets_registry.list_datasets():
-            if _slugify(existing.get("name", "")) == name:
-                self._json_response({"error": f"Dataset name '{name}' already exists"}, status=409)
-                return
+        # Ensure dataset name (slug) is unique — but if a same-name dataset
+        # exists in a non-recoverable state (status == 'error', or 'ready'
+        # with 0 latents), silently evict it so the user can retry with the
+        # same name. Active or healthy datasets still block the new one.
+        for existing in list(datasets_registry.list_datasets()):
+            if _slugify(existing.get("name", "")) != name:
+                continue
+            status = existing.get("status", "")
+            num_files = existing.get("num_files", 0) or existing.get("num_chunks", 0)
+            is_zombie = (status == "error") or (status == "ready" and num_files == 0)
+            if is_zombie:
+                datasets_registry.remove_dataset(existing["id"])
+                print(f"[datasets] Replacing zombie dataset '{existing['id']}' "
+                      f"(status={status}, num_files={num_files}) — same name '{name}'")
+                continue
+            self._json_response({
+                "error": f"Dataset name '{name}' already exists (id={existing['id']}, "
+                         f"status={status}). Delete it first."
+            }, status=409)
+            return
         if not gpus or not isinstance(gpus, list):
             self._json_response({"error": "gpus array required"}, status=400)
             return

@@ -6140,6 +6140,22 @@ if __name__ == "__main__":
     print("VRAM sampler started.")
     class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
-    server = ThreadedHTTPServer(("0.0.0.0", PORT), DashboardHandler)
-    print(f"Dashboard running on http://0.0.0.0:{PORT}")
+    # If the requested port is taken, walk forward to find the next free one.
+    # 50 ports is more than enough for any reasonable contention; bigger
+    # than that and there's clearly something else wrong on the box.
+    server = None
+    bind_port = PORT
+    for offset in range(50):
+        try:
+            server = ThreadedHTTPServer(("0.0.0.0", bind_port + offset), DashboardHandler)
+            if offset:
+                print(f"Port {PORT} taken — using {bind_port + offset} instead.")
+            break
+        except OSError as e:
+            if e.errno != 98:  # EADDRINUSE
+                raise
+    if server is None:
+        raise RuntimeError(f"Could not find a free port in {PORT}..{PORT + 49}")
+    actual_port = server.server_address[1]
+    print(f"Dashboard running on http://0.0.0.0:{actual_port}")
     server.serve_forever()

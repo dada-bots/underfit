@@ -6069,17 +6069,53 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
 def _resolve_backend_name():
     """Return what underfit.backends.get_backend() will resolve to for child procs.
-    Mirrors the logic in underfit.backends.__init__._autodetect / get_backend."""
-    name = os.environ.get("UNDERFIT_BACKEND", "").strip()
-    if name and name != "auto":
-        return name
+    Mirrors the logic in underfit.backends.__init__._autodetect / get_backend.
+
+    When a backend's checkout is on disk but the *package* isn't importable
+    (typical after `uv sync` wipes a wizard-installed editable), point the
+    user at the install command — telling them to `set UNDERFIT_BACKEND=sa3`
+    in that situation is actively misleading because the env var won't make
+    sa3 importable, the run will just crash deeper in the call stack.
+    """
     import importlib.util
+
+    explicit = os.environ.get("UNDERFIT_BACKEND", "").strip()
+    if explicit and explicit != "auto":
+        # User picked one — still warn if the package isn't actually importable.
+        modname = {"sa3": "stable_audio_3", "sat_dev": "stable_audio_tools"}.get(explicit)
+        if modname and importlib.util.find_spec(modname) is None:
+            checkout_dir = {
+                "sa3":     str(BASE_DIR.parent / "stable-audio-3"),
+                "sat_dev": str(BASE_DIR.parent / "stable-audio-tools"),
+            }.get(explicit, "")
+            extras = {"sa3": "[lora,ui]", "sat_dev": "[train,ui]"}.get(explicit, "")
+            hint = (f" — {modname!r} is not installed. "
+                    f"Run: .venv/bin/uv pip install -e {checkout_dir}{extras}")
+            return f"{explicit}  ⚠ {hint}"
+        return explicit
+
+    # Auto: prefer sa3 if importable, then sat_dev.
     if importlib.util.find_spec("stable_audio_3") is not None:
         return "sa3"
-    sa3_local = str(BASE_DIR.parent / "stable-audio-3")
-    if os.path.isdir(os.path.join(sa3_local, "stable_audio_3")):
-        return f"sat_dev  (note: sa3 checkout at {sa3_local} exists but is not on sys.path; set UNDERFIT_BACKEND=sa3 to use it)"
-    return "sat_dev"
+    if importlib.util.find_spec("stable_audio_tools") is not None:
+        return "sat_dev"
+
+    # Neither importable. Walk the candidate checkouts to give an install hint.
+    candidates = [
+        ("sa3",     "stable_audio_3",     BASE_DIR.parent / "stable-audio-3",          "[lora,ui]"),
+        ("sat_dev", "stable_audio_tools", BASE_DIR.parent / "stable-audio-tools",      "[train,ui]"),
+    ]
+    on_disk = [(b, mod, p, ex) for b, mod, p, ex in candidates
+               if (p / mod).is_dir()]
+    if on_disk:
+        lines = ["NONE_IMPORTABLE  ⚠ no backend package is installed in this venv."]
+        for b, mod, p, ex in on_disk:
+            lines.append(f"   {b}: checkout at {p} — install with:")
+            lines.append(f"       .venv/bin/uv pip install -e {p}{ex}")
+        lines.append("   (or re-run: .venv/bin/underfit-setup)")
+        return "\n  ".join(lines)
+    return ("NONE_IMPORTABLE  ⚠ no backend package or checkout found. "
+            "Run .venv/bin/underfit-setup to install one.")
 
 
 if __name__ == "__main__":

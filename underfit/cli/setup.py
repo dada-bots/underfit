@@ -2,7 +2,7 @@
 
 Two phases:
 
-  1. Backend pick — choose stable-audio-tools (sat_dev) or stable-audio-3 (sa3),
+  1. Backend pick — choose stable-audio-tools (sat) or stable-audio-3 (sa3),
      install via uv pip / pip if missing.
   2. Model download — pick which Stable Audio 3 model packs to pull from the
      stabilityai HF org and stage into the dashboard's per-instance model
@@ -11,8 +11,8 @@ Two phases:
 
 Selection logic (backend phase):
   - Default to whichever backend is already installed
-  - If both installed: default to sat_dev
-  - If neither installed: default to sat_dev
+  - If both installed: default to sat
+  - If neither installed: default to sat
   - User can override with arrow / number keys
 
 Selection logic (model phase):
@@ -24,7 +24,7 @@ Re-running the wizard is safe: already-installed models are reported and
 skipped; the wizard only offers to download the ones you're missing.
 
 Non-interactive use:
-    underfit-setup --backend sat_dev --no-install   # backend phase only, verify
+    underfit-setup --backend sat --no-install   # backend phase only, verify
     underfit-setup --backend sa3 --skip-models      # backend phase only, no HF
     underfit-setup --backend sa3 --models sa3-medium,sa3-sm-music  # explicit set
 """
@@ -59,7 +59,7 @@ class Backend:
 
 BACKENDS: list[Backend] = [
     Backend(
-        key="sat_dev",
+        key="sat",
         label="stable-audio-tools",
         module="stable_audio_tools",
         clone_url="https://github.com/Stability-AI/stable-audio-tools.git",
@@ -312,7 +312,7 @@ def _editable_install(path: Path, extras: tuple[str, ...] = ()) -> int:
     """`uv pip install -e <path>[extras]` (or pip fallback).
 
     Extras matter: SA3's `lora` extra brings `dill` (required by its dataloader)
-    and pytorch_lightning; sat_dev's `train` extra brings pytorch_lightning,
+    and pytorch_lightning; sat's `train` extra brings pytorch_lightning,
     prefigure, etc. Without them, training fails at import time."""
     target = f"{path}[{','.join(extras)}]" if extras else str(path)
     cmd = [*_install_command(), "-e", target]
@@ -646,7 +646,7 @@ def run_backend_phase(args) -> Backend | None:
 def run_model_phase(args, backend: Backend) -> int:
     """Returns process exit code. Only runs for sa3 backend."""
     if backend.key != "sa3":
-        return 0  # nothing to do for sat_dev (it sources its own checkpoints)
+        return 0  # nothing to do for sat (it sources its own checkpoints)
 
     user = hf_whoami()
     if not user:

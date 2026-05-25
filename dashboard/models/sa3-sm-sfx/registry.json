@@ -4,7 +4,7 @@
   "description": "~530M, 120s, SAME-S encoder, T5-Gemma (SFX, ARC)",
   "backends": [
     "sa3",
-    "sat_dev"
+    "sat"
   ],
   "diffusion_objective": "rectified_flow",
   "_comment_encoder_id": "Identifies the autoencoder family. Models with the same encoder_id share a latent space \u2014 datasets pre-encoded for one are reusable across all. Verified by pretransform weight equality.",

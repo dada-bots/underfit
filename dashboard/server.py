@@ -158,7 +158,7 @@ def _load_models_from_json():
         # Build MODEL_INFO entry (matches the shape used by hardcoded entries).
         # Template path follows convention: training_template.json next to registry.json.
         paths = m["paths"]
-        # Normalize backends: accept either the new 'backends': ['sa3', 'sat_dev']
+        # Normalize backends: accept either the new 'backends': ['sa3', 'sat']
         # list OR the legacy 'backend': 'sa3' scalar. Both materialize to a list
         # in MODEL_INFO so downstream code only has to handle one shape.
         if "backends" in m:
@@ -266,17 +266,17 @@ def _backend_env_for_model(model_key):
     """Return an env-var fragment to set UNDERFIT_BACKEND for a given base model.
 
     Each MODEL_INFO entry declares a list of supported backends (e.g. SA3
-    models support both 'sa3' and 'sat_dev' since the codepath is compatible).
+    models support both 'sa3' and 'sat' since the codepath is compatible).
     Pick the first one whose Python package is importable in the venv — that
     way 'pip install -e <sa3>' alone is enough to run an SA3 model even when
-    the registry also lists sat_dev as compatible. Returns "" if none of the
+    the registry also lists sat as compatible. Returns "" if none of the
     declared backends are importable (falls back to autodetect downstream).
     """
     import importlib.util
     info = MODEL_INFO.get(model_key) or {}
     backends = info.get("backends") or []
     # Skip backends whose Python package isn't installed.
-    mod_for = {"sa3": "stable_audio_3", "sat_dev": "stable_audio_tools"}
+    mod_for = {"sa3": "stable_audio_3", "sat": "stable_audio_tools"}
     for b in backends:
         modname = mod_for.get(b)
         if modname and importlib.util.find_spec(modname) is not None:
@@ -291,12 +291,12 @@ VENV_ACTIVATE = os.environ.get(
     "UNDERFIT_VENV_ACTIVATE",
     str(Path(sys.executable).parent / "activate"),
 )
-# Path to the stable-audio-tools checkout (used by the sat_dev backend to
+# Path to the stable-audio-tools checkout (used by the sat backend to
 # read its defaults.ini). Defaults to a sibling clone next to underfit —
-# the location where `underfit-setup --backend sat_dev` clones to. Override
+# the location where `underfit-setup --backend sat` clones to. Override
 # with UNDERFIT_SAT_DEV_DIR if your checkout lives elsewhere.
 SA_TOOLS_DIR = Path(os.environ.get("UNDERFIT_SAT_DEV_DIR", BASE_DIR.parent / "stable-audio-tools")).expanduser()
-# Use Underfit's backend-agnostic launcher; selects sat_dev or sa3 backend
+# Use Underfit's backend-agnostic launcher; selects sat or sa3 backend
 # from --backend / UNDERFIT_BACKEND. Falls back to auto-detect.
 RUN_GRADIO_SCRIPT = str(BASE_DIR / "run_gradio.py")
 GRADIO_PORT_BASE = 7860
@@ -6235,28 +6235,28 @@ def _resolve_backend_name():
     explicit = os.environ.get("UNDERFIT_BACKEND", "").strip()
     if explicit and explicit != "auto":
         # User picked one — still warn if the package isn't actually importable.
-        modname = {"sa3": "stable_audio_3", "sat_dev": "stable_audio_tools"}.get(explicit)
+        modname = {"sa3": "stable_audio_3", "sat": "stable_audio_tools"}.get(explicit)
         if modname and importlib.util.find_spec(modname) is None:
             checkout_dir = {
                 "sa3":     str(BASE_DIR.parent / "stable-audio-3"),
-                "sat_dev": str(BASE_DIR.parent / "stable-audio-tools"),
+                "sat": str(BASE_DIR.parent / "stable-audio-tools"),
             }.get(explicit, "")
-            extras = {"sa3": "[lora,ui]", "sat_dev": "[train,ui]"}.get(explicit, "")
+            extras = {"sa3": "[lora,ui]", "sat": "[train,ui]"}.get(explicit, "")
             hint = (f" — {modname!r} is not installed. "
                     f"Run: .venv/bin/uv pip install -e {checkout_dir}{extras}")
             return f"{explicit}  ⚠ {hint}"
         return explicit
 
-    # Auto: prefer sa3 if importable, then sat_dev.
+    # Auto: prefer sa3 if importable, then sat.
     if importlib.util.find_spec("stable_audio_3") is not None:
         return "sa3"
     if importlib.util.find_spec("stable_audio_tools") is not None:
-        return "sat_dev"
+        return "sat"
 
     # Neither importable. Walk the candidate checkouts to give an install hint.
     candidates = [
         ("sa3",     "stable_audio_3",     BASE_DIR.parent / "stable-audio-3",          "[lora,ui]"),
-        ("sat_dev", "stable_audio_tools", BASE_DIR.parent / "stable-audio-tools",      "[train,ui]"),
+        ("sat", "stable_audio_tools", BASE_DIR.parent / "stable-audio-tools",      "[train,ui]"),
     ]
     on_disk = [(b, mod, p, ex) for b, mod, p, ex in candidates
                if (p / mod).is_dir()]

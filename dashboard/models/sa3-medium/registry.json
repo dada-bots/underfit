@@ -2,7 +2,7 @@
   "key": "sa3-medium",
   "label": "SA3-medium",
   "description": "~1.5B, 380s, SAME-L encoder, T5-Gemma (HF release)",
-  "backends": ["sa3", "sat_dev"],
+  "backends": ["sa3", "sat"],
   "diffusion_objective": "rectified_flow",
   "encoder_id": "SAME-L",
   "_comment_compatible_encoders": "Encoder ids whose datasets can train this model. SAME-S is a distillation of SAME-L, so latents are interchangeable in either direction.",

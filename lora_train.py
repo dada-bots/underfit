@@ -2,7 +2,7 @@
 """LoRA training launcher for the Underfit dashboard.
 
 Thin wrapper around underfit.training.run_training. The training loop is
-backend-agnostic (sat_dev or sa3) and lives in underfit/training/loop.py.
+backend-agnostic (sat or sa3) and lives in underfit/training/loop.py.
 """
 import os
 import sys
@@ -97,7 +97,7 @@ def get_all_args(defaults_file="defaults.ini"):
     p.add_argument("--config-file", default=defaults_file)
     p.add_argument("--wandb-config", default=None)
     p.add_argument("--backend", default=None,
-                  help="sat_dev | sa3 (default: env UNDERFIT_BACKEND or auto)")
+                  help="sat | sa3 (default: env UNDERFIT_BACKEND or auto)")
     for key, value in defaults.items():
         arg_name = f"--{key.replace('_', '-')}"
         try:

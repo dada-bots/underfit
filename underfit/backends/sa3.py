@@ -30,7 +30,7 @@ def _require_sa3():
         if importlib.util.find_spec("stable_audio_3") is None:
             raise ImportError(
                 "stable_audio_3 not importable. Either pip install -e "
-                f"{_SA3_LOCAL!r} or set UNDERFIT_BACKEND=sat_dev."
+                f"{_SA3_LOCAL!r} or set UNDERFIT_BACKEND=sat."
             )
     _patch_sa3_compatibility()
 
@@ -178,7 +178,7 @@ def demo_sample(model, model_config, cond_list, *, steps, cfg_scale,
                 seed=None, dist_shift=None, diffusion_objective_override=None,
                 duration_latents=None, sample_rate=None):
     # duration_latents / sample_rate are accepted (and ignored) for surface
-    # parity with sat_dev.demo_sample. The pipeline derives its own latent
+    # parity with sat.demo_sample. The pipeline derives its own latent
     # length from cond_list's seconds_total + chunk alignment, so passing a
     # fixed length isn't useful here.
     """Pipeline-style demo sampling. Routes through StableAudioModel.generate

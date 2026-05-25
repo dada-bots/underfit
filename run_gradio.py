@@ -1,6 +1,6 @@
 """Underfit gradio launcher.
 
-Backend-agnostic wrapper. Selects between the sat_dev and sa3 backends and
+Backend-agnostic wrapper. Selects between the sat and sa3 backends and
 delegates UI construction to the backend's create_gradio_ui().
 
 CLI is the same as SAT-dev's run_gradio.py so dashboard launches don't need
@@ -72,7 +72,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run gradio interface (Underfit)")
-    parser.add_argument("--backend", default=None, help="sat_dev | sa3 (default: env UNDERFIT_BACKEND or auto)")
+    parser.add_argument("--backend", default=None, help="sat | sa3 (default: env UNDERFIT_BACKEND or auto)")
     parser.add_argument("--pretrained-name", type=str, required=False)
     parser.add_argument("--model-config", type=str, required=False)
     parser.add_argument("--ckpt-path", type=str, required=False)

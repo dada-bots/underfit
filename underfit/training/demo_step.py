@@ -416,7 +416,7 @@ def run_demo_step(model, backend, demo_config, step, sample_size, sample_rate, d
 
     Args:
         model: the diffusion model wrapper (has .model, .conditioner, .pretransform).
-        backend: underfit.backends.<sat_dev|sa3> module.
+        backend: underfit.backends.<sat|sa3> module.
         demo_config: dict from model_config.training.demo. Keys we honor:
             demo_cond, demo_cfg_scales, demo_steps,
             arc_lora_path, arc_full_model_path, arc_full_model_config,

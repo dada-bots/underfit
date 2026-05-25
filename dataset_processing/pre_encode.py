@@ -253,9 +253,9 @@ def _expand_files_to_tasks(audio_files, input_dir):
 
 
 def _build_pretransform(pretransform_config, sample_rate):
-    """Build a pretransform via the active backend (sa3 or sat_dev).
+    """Build a pretransform via the active backend (sa3 or sat).
 
-    The backend module owns the construction logic — sat_dev has to work
+    The backend module owns the construction logic — sat has to work
     around a brittle autoencoders→diffusion import; sa3 just delegates to its
     factory. Picked via UNDERFIT_BACKEND env var or auto-detect.
     """

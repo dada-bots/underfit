@@ -7,7 +7,7 @@ name = "underfit"
 version = "0.1.0"
 description = "LoRA finetuning for Stable Audio models"
 readme = "README.md"
-# 3.10 only — sat_dev pins this hard; sa3 is happy with anything >= 3.10.
+# 3.10 only — sat pins this hard; sa3 is happy with anything >= 3.10.
 # uv will auto-fetch a 3.10 interpreter if the system doesn't have one.
 requires-python = ">=3.10,<3.11"
 license = { text = "MIT" }
@@ -24,7 +24,7 @@ keywords = ["audio", "diffusion", "lora", "stable-audio", "fine-tuning"]
 # The diffusion backend (stable-audio-tools or stable-audio-3) is intentionally
 # NOT listed here — `install.sh` runs the setup wizard which installs whichever
 # backend the user picks. underfit auto-detects which backend is present at
-# runtime, or honors UNDERFIT_BACKEND={sat_dev,sa3}.
+# runtime, or honors UNDERFIT_BACKEND={sat,sa3}.
 #
 # Pins below mirror the constraints both supported backends hard-pin (torch
 # 2.7.1 + cu126), so `uv pip install -e <backend>` is a no-op for these
@@ -48,7 +48,7 @@ dependencies = [
 # Volta/Turing/Ampere/Ada/Hopper PLUS Blackwell (RTX 50xx, RTX PRO 6000,
 # DGX B100/B200). Requires NVIDIA driver R570+, which is the norm on any
 # host that has a Blackwell card and is widely deployed elsewhere too.
-# Both sa3 and sat_dev pin cu126 internally, but uv will prefer the index
+# Both sa3 and sat pin cu126 internally, but uv will prefer the index
 # declared here for the torch/torchaudio top-level deps.
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"

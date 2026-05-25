@@ -1,7 +1,7 @@
 """LoRA setup for the raw-PyTorch training loop.
 
 Adapter-agnostic: takes a backend module so the same code path works for
-both sat_dev and sa3.
+both sat and sa3.
 """
 from functools import partial
 from pathlib import Path

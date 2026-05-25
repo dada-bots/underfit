@@ -15,7 +15,7 @@ from stable_audio_tools.data.dataset import create_dataloader_from_config
 from underfit.utils import copy_state_dict, load_ckpt_state_dict, unwrap_state_dict
 
 
-NAME = "sat_dev"
+NAME = "sat"
 
 
 def create_model(model_config):

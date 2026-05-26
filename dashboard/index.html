@@ -3449,35 +3449,61 @@ async function refreshGradio() {
   }
 }
 
+// True once runsData has been populated by either loadRuns or the SSE
+// stream — gates the empty-state DOM toggle so the initial refresh()
+// (which runs before SSE connects) doesn't flash "No training runs"
+// while real data is still in flight.
+let _runsLoaded = false;
+
+// Flip empty-dashboard / run-detail visibility based on runsData, and
+// fire the dependent side effects when empty.
+function _applyRunsView() {
+  if (!_runsLoaded) return null;     // wait for authoritative data
+  const hasRuns = Array.isArray(runsData) && runsData.length > 0;
+  document.getElementById('run-detail').style.display = hasRuns ? '' : 'none';
+  document.getElementById('empty-dashboard').style.display = hasRuns ? 'none' : 'block';
+  if (!hasRuns) {
+    document.getElementById('status-text').style.display = 'none';
+    document.getElementById('new-finetune-btn').style.display = '';
+    document.getElementById('new-dataset-btn').style.display = '';
+    fetch('/api/datasets').then(r => r.json()).then(ds => {
+      const _has = Array.isArray(ds) && ds.length > 0;
+      window._hasDatasets = _has;
+      window._datasetsChecked = true;
+      document.getElementById('datasets-btn').style.display = _has ? '' : 'none';
+    }).catch(() => {});
+    document.getElementById('main-loading').classList.remove('active');
+  }
+  return hasRuns;
+}
+
+// Auto-select currentRunId from runsData. Extracted from loadRuns so the
+// SSE runs handler can reuse the same logic without an extra HTTP fetch.
+function _autoSelectRun() {
+  if (currentRunId && runsData.find(r => r.id === currentRunId)) return;
+  const _parsed = _parseStepFromPath();
+  const urlSlug = _parsed.slug;
+  if (_parsed.step != null) _pendingStepFromUrl = _parsed.step;
+  if (_parsed.demo != null) _pendingDemoFromUrl = _parsed.demo;
+  const urlMatch = urlSlug && runsData.find(r => r.display_name === urlSlug);
+  if (urlMatch) { currentRunId = urlMatch.id; return; }
+  const saved = localStorage.getItem('dashboard_tab');
+  if (saved && runsData.find(r => r.id === saved)) { currentRunId = saved; return; }
+  const training = runsData.filter(r => ['training', 'loading', 'resuming', 'demos'].includes(r.status));
+  if (training.length > 0) {
+    training.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    currentRunId = training[0].id;
+    return;
+  }
+  currentRunId = runsData[0] ? runsData[0].id : null;
+}
+
 async function loadRuns() {
   try {
     const res = await fetch('/api/runs');
     runsData = await res.json();
-    // Auto-select: keep current, restore from URL path, localStorage, pick active training, or first
-    if (!currentRunId || !runsData.find(r => r.id === currentRunId)) {
-      // Check URL path for /{display_name} or /{display_name}/step{N} deep link
-      const _parsed = _parseStepFromPath();
-      const urlSlug = _parsed.slug;
-      if (_parsed.step != null) _pendingStepFromUrl = _parsed.step;
-      if (_parsed.demo != null) _pendingDemoFromUrl = _parsed.demo;
-      const urlMatch = urlSlug && runsData.find(r => r.display_name === urlSlug);
-      if (urlMatch) {
-        currentRunId = urlMatch.id;
-      } else {
-        const saved = localStorage.getItem('dashboard_tab');
-        if (saved && runsData.find(r => r.id === saved)) {
-          currentRunId = saved;
-        } else {
-          const training = runsData.filter(r => ['training', 'loading', 'resuming', 'demos'].includes(r.status));
-          if (training.length > 0) {
-            training.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-            currentRunId = training[0].id;
-          } else {
-            currentRunId = runsData[0] ? runsData[0].id : null;
-          }
-        }
-      }
-    }
+    _runsLoaded = true;
+    _autoSelectRun();
     renderTabs();
     _startLbtPolling();
   } catch (e) {
@@ -3617,10 +3643,8 @@ window.switchRun = async function(runId, skipPush) {
 };
 
 
-async function refreshGpu() {
+function _applyGpu(data) {
   try {
-    const res = await fetch('/api/gpu');
-    const data = await res.json();
     const gpus = data.gpus || [];
     if (data.gradio_estimate) _gradioVramEstimate = data.gradio_estimate;
     if (data.arc_info) _arcInfo = data.arc_info;
@@ -3694,6 +3718,16 @@ async function refreshGpu() {
     }).join('');
     updateGpuVramChartLive();
     refreshOpenModalGpuGrids();
+  } catch (e) {
+    document.getElementById('gpu-row').innerHTML = '';
+  }
+}
+
+async function refreshGpu() {
+  try {
+    const res = await fetch('/api/gpu');
+    const data = await res.json();
+    _applyGpu(data);
   } catch (e) {
     document.getElementById('gpu-row').innerHTML = '';
   }
@@ -4121,28 +4155,17 @@ function _renderDemos(newDemoData, refreshRunId) {
 
 async function refresh() {
   try {
-    await loadRuns();
-    // Empty-state: no runs at all → swap detail panel for placeholder.
-    const _hasRuns = Array.isArray(runsData) && runsData.length > 0;
-    document.getElementById('run-detail').style.display = _hasRuns ? '' : 'none';
-    document.getElementById('empty-dashboard').style.display = _hasRuns ? 'none' : 'block';
+    // When USE_SSE is on the stream populates runsData + does the
+    // auto-select; loadRuns would be a redundant fetch of /api/runs.
+    if (!USE_SSE) await loadRuns();
+    // Empty-state toggle. _applyRunsView returns null until we've had
+    // authoritative data — that prevents the initial refresh() (which
+    // runs before SSE connects) from flashing "No training runs".
+    const _hasRuns = _applyRunsView();
+    if (_hasRuns === null) return;   // wait for SSE/loadRuns to deliver
     if (!_hasRuns) {
-      // Header bits that _renderStatus normally toggles — do them here since
-      // we short-circuit before status fetch.
-      document.getElementById('status-text').style.display = 'none';
-      document.getElementById('new-finetune-btn').style.display = '';
-      document.getElementById('new-dataset-btn').style.display = '';
-      // Also show DATASETS button if any datasets exist — without this the
-      // user has no way to reach the dataset list until they have a run.
-      fetch('/api/datasets').then(r => r.json()).then(ds => {
-        const _has = Array.isArray(ds) && ds.length > 0;
-        window._hasDatasets = _has;
-        window._datasetsChecked = true;
-        document.getElementById('datasets-btn').style.display = _has ? '' : 'none';
-      }).catch(() => {});
-      document.getElementById('main-loading').classList.remove('active');
       // Still refresh GPUs so users can see VRAM availability.
-      refreshGpu();
+      if (!USE_SSE) refreshGpu();
       return;
     }
     const refreshRunId = currentRunId;  // snapshot AFTER loadRuns so first call doesn't abort
@@ -4152,33 +4175,31 @@ async function refresh() {
     delSection.style.display = currentRunId ? '' : 'none';
     document.getElementById('delete-trigger').style.display = '';
     document.getElementById('delete-btn').classList.remove('shown');
-    // Fire all fetches independently — each section renders when its data arrives
+    // Fire all fetches independently — each section renders when its data arrives.
+    // When USE_SSE is on, status / checkpoints / demos / gradio all come via
+    // the long-lived /api/stream connection, so these one-off fetches would
+    // be pure duplication.
     const qs = currentRunId ? `?run_id=${encodeURIComponent(currentRunId)}` : '';
 
-    const statusPromise = fetch('/api/status' + qs).then(r => r.json()).then(status => {
-      _renderStatus(status, refreshRunId);
-    });
-
-    const checkpointsPromise = fetch('/api/checkpoints' + qs).then(r => r.json()).then(data => {
-      _renderCheckpoints(data, refreshRunId);
-    });
-
-    const demosPromise = fetch('/api/demos' + qs).then(r => r.json()).then(newDemoData => {
-      _renderDemos(newDemoData, refreshRunId);
-    });
-
-    const gradioPromise = refreshGradio();
-
-    // Wait for all to complete (errors caught individually)
-    await Promise.all([
-      statusPromise.catch(e => console.error('Status fetch error:', e)),
-      checkpointsPromise.catch(e => console.error('Checkpoints fetch error:', e)),
-      demosPromise.catch(e => console.error('Demos fetch error:', e)),
-      gradioPromise.catch(e => console.error('Gradio refresh error:', e)),
-    ]);
+    const promises = [];
+    if (!USE_SSE) {
+      promises.push(
+        fetch('/api/status' + qs).then(r => r.json()).then(status => {
+          _renderStatus(status, refreshRunId);
+        }).catch(e => console.error('Status fetch error:', e)),
+        fetch('/api/checkpoints' + qs).then(r => r.json()).then(data => {
+          _renderCheckpoints(data, refreshRunId);
+        }).catch(e => console.error('Checkpoints fetch error:', e)),
+        fetch('/api/demos' + qs).then(r => r.json()).then(newDemoData => {
+          _renderDemos(newDemoData, refreshRunId);
+        }).catch(e => console.error('Demos fetch error:', e)),
+        refreshGradio().catch(e => console.error('Gradio refresh error:', e)),
+      );
+    }
+    await Promise.all(promises);
 
     if (currentRunId !== refreshRunId) return;
-    refreshGpu();
+    if (!USE_SSE) refreshGpu();
     // Fade in delete button and dismiss loading overlay
     document.getElementById('main-loading').classList.remove('active');
     if (currentRunId) {
@@ -7589,18 +7610,139 @@ if (currentRunId) {
   history.replaceState({runId: currentRunId, step: _initParsed.step}, '', '/' + encodeURIComponent(initSlug) + _initStepPart);
 }
 
+// Feature flag for the long-lived /api/stream EventSource that replaces
+// the runs/status/log_tail/loss_by_timestep poll loops. Declared up here
+// because _scheduleRefresh() below reads it. Set to false to fall back
+// to pure polling.
+const USE_SSE = true;
+
 refresh();
-// Adaptive polling: 3s during demo generation, 10s otherwise
+// Adaptive polling: 3s during demo generation, 10s otherwise.
+// When USE_SSE is on, the fast-changing bits (runs/status/log/lbt) come
+// via a long-lived EventSource (see below); refresh() then only needs to
+// handle slow-changing UI (checkpoints/demos/gradio/gpu/empty-state), so
+// we stretch its cadence to 30s to save requests.
 let _refreshTimer = null;
 function _scheduleRefresh() {
-  const fast = _currentStatus && _currentStatus.status === 'demos';
-  const ms = fast ? 3000 : 10000;
+  const fast = !USE_SSE && _currentStatus && _currentStatus.status === 'demos';
+  const ms = USE_SSE ? 30000 : (fast ? 3000 : 10000);
   _refreshTimer = setTimeout(async () => {
     await refresh();
     _scheduleRefresh();
   }, ms);
 }
 _scheduleRefresh();
+
+// ── SSE: server-pushed dashboard state ─────────────────────────────────
+// One long-lived EventSource replaces three poll loops:
+//   - the /api/runs fetch inside refresh()
+//   - the per-3s /api/log_tail setInterval below
+//   - the per-10s /api/loss_by_timestep _fetchLbt timer
+// (USE_SSE is declared above where _scheduleRefresh references it.)
+let _streamSource    = null;
+let _streamRunId     = null;
+let _streamLogSize   = 0;
+let _streamLbtSize   = 0;
+let _streamRunsEtag  = '';
+
+function _streamConnect() {
+  if (!USE_SSE) return;
+  if (_streamSource) { try { _streamSource.close(); } catch (_) {} }
+  _streamRunId    = currentRunId;
+  _streamLogSize  = 0;
+  _streamLbtSize  = 0;
+  _streamRunsEtag = '';
+  // Reset main-log state to match the fresh server replay
+  _mainLogText        = '';
+  _mainLogFileSize    = 0;
+  _mainLogLastRunId   = currentRunId;
+  const qs = new URLSearchParams({
+    run_id:    currentRunId || '',
+    log_size:  _streamLogSize,
+    lbt_size:  _streamLbtSize,
+    runs_etag: _streamRunsEtag,
+  });
+  _streamSource = new EventSource(`/api/stream?${qs}`);
+  _streamSource.onmessage = (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch (_) { return; }
+    if (d.runs) {
+      runsData = d.runs;
+      _streamRunsEtag = d.runs_etag || _streamRunsEtag;
+      _runsLoaded = true;
+      _autoSelectRun();   // pick currentRunId on first delivery / when stale
+      renderTabs();
+      _applyRunsView();   // flip empty-state visibility now that data's in
+    }
+    if (d.gpu) {
+      _applyGpu(d.gpu);
+    }
+    if (d.status) {
+      _renderStatus(d.status, currentRunId);
+    }
+    if (d.log) {
+      const data = d.log;
+      if (typeof data.file_size === 'number') {
+        _mainLogFileSize = data.file_size;
+        _streamLogSize   = data.file_size;
+      }
+      if (data.log_tail) {
+        if (_mainLogText === '' && !data.replace_last_line) {
+          _mainLogText = data.log_tail;
+        } else if (data.replace_last_line && _mainLogText) {
+          const lastNl = _mainLogText.lastIndexOf('\n');
+          _mainLogText = (lastNl >= 0 ? _mainLogText.substring(0, lastNl + 1) : '') + data.log_tail;
+        } else {
+          _mainLogText += data.log_tail;
+        }
+        document.getElementById('log-section').style.display = '';
+        const lc = document.getElementById('log-container');
+        const wasAtBottom = lc.classList.contains('open') && lc.scrollHeight - lc.scrollTop - lc.clientHeight < 60;
+        _setLogContent(document.getElementById('log-content'), _mainLogText);
+        if (wasAtBottom) lc.scrollTop = lc.scrollHeight;
+      }
+    }
+    if (d.lbt) {
+      _streamLbtSize = d.lbt.file_size || _streamLbtSize;
+      if (d.lbt.bins && d.lbt.bins.some(b => b.curve.length > 0)) {
+        _lbtData = d.lbt;
+        document.getElementById('loss-charts-row').style.display = '';
+        document.getElementById('lbt-chart-section').style.display = '';
+        _renderLbtChart();
+      }
+    }
+    if (d.checkpoints) {
+      _renderCheckpoints(d.checkpoints, currentRunId);
+    }
+    if (d.demos) {
+      _renderDemos(d.demos, currentRunId);
+    }
+    if (d.gradio) {
+      gradioInstances = d.gradio;
+    }
+  };
+  _streamSource.onerror = (_e) => {
+    // EventSource auto-reconnects on transient drops; this is a safety
+    // net for prolonged errors — close and reopen explicitly.
+    try { _streamSource.close(); } catch (_) {}
+    setTimeout(_streamConnect, 2000);
+  };
+}
+
+// Watchdog: when the user switches runs, currentRunId changes — reopen
+// the SSE with the new run_id so server-side cursors reset.
+//
+// setTimeout(…, 0) defers the initial connect until the current
+// synchronous top-level script finishes — `_streamConnect` reads `let`
+// vars (_mainLogText, _mainLogFileSize, _mainLogLastRunId) that are
+// declared further down in this file. Calling it eagerly here would
+// trip TDZ before those declarations execute.
+if (USE_SSE) {
+  setInterval(() => {
+    if (currentRunId !== _streamRunId) _streamConnect();
+  }, 500);
+  setTimeout(_streamConnect, 0);
+}
 
 // Fast log tail poller — 1s updates for console output.
 //
@@ -7615,6 +7757,7 @@ let _mainLogFileSize = 0;
 let _mainLogLastRunId = null;
 let _mainLogBusy = false;
 setInterval(async () => {
+  if (USE_SSE) return;        // SSE pushes log deltas; this loop is the fallback
   if (!currentRunId) return;
   if (_mainLogBusy) return;
   if (currentRunId !== _mainLogLastRunId) {
@@ -7755,6 +7898,10 @@ function _updateLogTabStyles() {
 }
 
 function switchLogTab(tab) {
+  // Drop the explorer stream when leaving the training tab — only that
+  // tab uses it, and we don't want stale onmessage events racing the
+  // new tab's renderer.
+  if (_glogTab === 'training' && tab !== 'training') _explorerDisconnect();
   _glogTab = tab;
   _updateLogTabStyles();
   if (tab === 'server') {
@@ -7847,7 +7994,83 @@ function _renderLogList() {
   else _renderGradioLogList();
 }
 
+// SSE for the Log Explorer modal. Independent from the main dashboard's
+// _streamSource (which is tied to currentRunId) because the modal can
+// browse any run or any gradio instance. We keep at most one connection
+// open at a time — the active tab decides what it subscribes to.
+let _explorerStream = null;
+let _gradioLogFileSize = 0;
+function _explorerDisconnect() {
+  if (_explorerStream) { try { _explorerStream.close(); } catch (_) {} _explorerStream = null; }
+}
+function _explorerConnectTraining(runId) {
+  _explorerDisconnect();
+  if (!USE_SSE || !runId) return;
+  const qs = new URLSearchParams({
+    run_id:    runId,
+    log_size:  _trainingLogFileSize || 0,
+    lbt_size:  0,           // modal doesn't render lbt
+    runs_etag: '__skip__',  // modal doesn't render the runs list either
+  });
+  _explorerStream = new EventSource(`/api/stream?${qs}`);
+  _explorerStream.onmessage = (e) => {
+    let d; try { d = JSON.parse(e.data); } catch (_) { return; }
+    // Safety: ignore stale events if the user has switched runs / tabs
+    if (_glogTab !== 'training') return;
+    if (_gradioLogSelectedId !== runId) return;
+    if (d.log) {
+      const data = d.log;
+      if (typeof data.file_size === 'number') _trainingLogFileSize = data.file_size;
+      if (data.log_mtime) _trainingLogMtime = data.log_mtime;
+      if (data.log_tail) {
+        if (data.replace_last_line && _trainingLogText) {
+          const lastNl = _trainingLogText.lastIndexOf('\n');
+          _trainingLogText = (lastNl >= 0 ? _trainingLogText.substring(0, lastNl + 1) : '') + data.log_tail;
+        } else {
+          _trainingLogText += data.log_tail;
+        }
+        const pre = document.getElementById('glog-pre');
+        const viewer = document.getElementById('glog-viewer');
+        const wasAtBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 60;
+        _setLogContent(pre, _trainingLogText);
+        if (wasAtBottom) viewer.scrollTop = viewer.scrollHeight;
+        _updateTrainingLogHeader();
+      }
+    }
+  };
+  _explorerStream.onerror = () => _explorerDisconnect();
+}
+function _explorerConnectGradio(instanceId) {
+  _explorerDisconnect();
+  if (!USE_SSE || !instanceId) return;
+  const qs = new URLSearchParams({
+    gradio_id:        instanceId,
+    gradio_log_size:  _gradioLogFileSize || 0,
+    runs_etag:        '__skip__',
+  });
+  _explorerStream = new EventSource(`/api/stream?${qs}`);
+  _explorerStream.onmessage = (e) => {
+    let d; try { d = JSON.parse(e.data); } catch (_) { return; }
+    if (_glogTab !== 'gradio') return;
+    if (_gradioLogSelectedId !== instanceId) return;
+    if (d.gradio_log) {
+      const data = d.gradio_log;
+      if (typeof data.file_size === 'number') _gradioLogFileSize = data.file_size;
+      if (data.content) {
+        const pre = document.getElementById('glog-pre');
+        const viewer = document.getElementById('glog-viewer');
+        const wasAtBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 60;
+        _setLogContent(pre, data.content);
+        if (wasAtBottom) viewer.scrollTop = viewer.scrollHeight;
+        _updateGradioLogHeader();
+      }
+    }
+  };
+  _explorerStream.onerror = () => _explorerDisconnect();
+}
+
 async function selectTrainingLog(runId) {
+  _explorerDisconnect();  // drop any prior stream before re-priming the cursors
   _gradioLogSelectedId = runId;
   _renderTrainingLogList();
   _trainingLogMtime = null;
@@ -7873,6 +8096,8 @@ async function selectTrainingLog(runId) {
   }
   const viewer = document.getElementById('glog-viewer');
   viewer.scrollTop = viewer.scrollHeight;
+  // Hand off the live updates to the stream so we stop polling.
+  _explorerConnectTraining(runId);
 }
 
 async function openGradioLogExplorer(instanceId, runId, defaultTab) {
@@ -7934,6 +8159,7 @@ async function openGradioLogExplorer(instanceId, runId, defaultTab) {
 function closeGradioLogExplorer() {
   document.getElementById('gradio-log-modal').classList.remove('active');
   if (_gradioLogRefreshTimer) { clearInterval(_gradioLogRefreshTimer); _gradioLogRefreshTimer = null; }
+  _explorerDisconnect();
   _gradioLogSelectedId = null;
 }
 
@@ -8019,7 +8245,9 @@ function _updateGradioLogHeader() {
 }
 
 async function selectGradioLog(instanceId) {
+  _explorerDisconnect();  // drop any prior stream before re-priming the cursor
   _gradioLogSelectedId = instanceId;
+  _gradioLogFileSize = 0;
   _renderGradioLogList();
   _updateGradioLogHeader();
   const pre = document.getElementById('glog-pre');
@@ -8040,6 +8268,8 @@ async function selectGradioLog(instanceId) {
   // Auto-scroll to bottom
   const viewer = document.getElementById('glog-viewer');
   viewer.scrollTop = viewer.scrollHeight;
+  // Hand off live updates to the stream.
+  _explorerConnectGradio(instanceId);
 }
 
 async function refreshGradioLog() {
@@ -8065,7 +8295,13 @@ async function refreshGradioLog() {
     return;
   }
   if (tabAtRefreshStart === 'training') {
-    // Refresh training log (incremental — send raw file_size, get only new bytes)
+    // SSE handles incremental updates for the training tab.
+    if (USE_SSE && _explorerStream) {
+      _updateTrainingLogHeader();
+      return;
+    }
+    // Polling fallback (pre-SSE, or when the explorer stream dropped):
+    // incremental — send raw file_size, get only new bytes.
     try {
       const res = await fetch(`/api/log_tail?run_id=${encodeURIComponent(_gradioLogSelectedId)}&file_size=${_trainingLogFileSize}`);
       if (_glogTab !== tabAtRefreshStart) return;
@@ -8085,7 +8321,20 @@ async function refreshGradioLog() {
       _updateTrainingLogHeader();
     } catch (_) {}
   } else {
-    // Refresh gradio log
+    // When USE_SSE is on the main dashboard's stream already keeps
+    // gradioInstances fresh; the explorer's own stream (if alive) handles
+    // the log content. Either way, don't poll /api/gradio or
+    // /api/gradio/<id>/log — just mirror the global instance list and
+    // re-render. The early-return version that required _explorerStream
+    // was too strict — when the per-tab stream is briefly down during
+    // reconnect, falling back to a poll defeats the whole point.
+    if (USE_SSE) {
+      _gradioLogInstances = gradioInstances;
+      _renderGradioLogList();
+      _updateGradioLogHeader();
+      return;
+    }
+    // Polling fallback (USE_SSE=false).
     try {
       const res = await fetch(`/api/gradio/${_gradioLogSelectedId}/log?tail=1000`);
       if (_glogTab !== tabAtRefreshStart) return;
@@ -8096,7 +8345,6 @@ async function refreshGradioLog() {
         pre.textContent = '(no log file)';
       }
     } catch (_) {}
-    // Also refresh instance list (for updated mtimes + header)
     try {
       const res = await fetch('/api/gradio');
       _gradioLogInstances = await res.json();
@@ -8117,6 +8365,7 @@ let _lbtData = null;
 let _lbtTimer = null;
 
 function _startLbtPolling() {
+  if (USE_SSE) return;        // SSE pushes lbt deltas
   if (_lbtTimer) clearInterval(_lbtTimer);
   _lbtTimer = setInterval(_fetchLbt, 10000);
   _fetchLbt();
@@ -8124,6 +8373,7 @@ function _startLbtPolling() {
 
 let _lbtBusy = false;
 async function _fetchLbt() {
+  if (USE_SSE) return;       // SSE pushes lbt deltas
   if (!currentRunId) return;
   if (_lbtBusy) return;  // prevent pile-up — file lives on slow Drive on Colab
   _lbtBusy = true;

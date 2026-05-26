@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Training dashboard server for LoRA finetuning runs."""
 
+import hashlib
 import json
 import os
 import random
@@ -3017,6 +3018,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._json_response(self._get_clone_settings(run_id))
         elif path == "/api/loss_by_timestep":
             self._json_response(self._get_loss_by_timestep(run_id))
+        elif path == "/api/stream":
+            self._serve_dashboard_stream(run_id, params)
+            return
         elif path == "/api/demos":
             run = registry.get_run(run_id) if run_id else None
             # Process demos on-demand: explicit refresh OR active training run (throttled to 10s)
@@ -4334,6 +4338,252 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
+
+    def _serve_dashboard_stream(self, run_id, params):
+        """SSE endpoint replacing the dashboard's per-second polling.
+
+        One long-lived response per browser tab. Each second the server
+        rebuilds the composite state (runs / status / log delta / lbt
+        delta) and writes ONLY what's changed since the client last
+        rendered. Frees the browser from polling and stays comfortably
+        under ngrok's 40-new-connections/min cap (one connection per
+        session).
+
+        Query params let the client resume after a reconnect — the
+        browser's EventSource will reopen on disconnect, and Last-Event-ID
+        carries the most recent sequence number we sent. (We just use
+        them as starting hints; the in-loop bookkeeping is the source of
+        truth thereafter.)
+
+        Pacing:
+          - 1s tick when there's something to send
+          - empty ticks still write a `: ping\\n\\n` comment line so the
+            relay (ngrok / Colab proxy) doesn't time out the connection
+          - exits cleanly on BrokenPipe / ConnectionReset
+        """
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")  # disable nginx/proxy buffering
+            self.end_headers()
+        except Exception:
+            return
+
+        # Initial state pointers — caller can pass these in via query string
+        # after a reconnect to skip already-seen content.
+        log_size  = int(params.get("log_size",  [0])[0])
+        lbt_size  = int(params.get("lbt_size",  [0])[0])
+        runs_etag = params.get("runs_etag", [""])[0]
+        # Caller can opt out of the (volatile, ~hash-changes-every-tick) runs
+        # payload by passing runs_etag=__skip__ — used by the Log Explorer
+        # modal which doesn't render the tabs.
+        skip_runs = runs_etag == "__skip__"
+        last_status_blob   = ""
+        last_ckpts_etag    = ""
+        last_demos_etag    = ""
+        last_gradio_etag   = ""
+        last_gpu_etag      = ""
+        next_demo_kick     = 0     # throttled demo-processing trigger
+
+        # Optional Gradio-log subscription (used by the Log Explorer modal's
+        # gradio tab). One stream subscribes to either run-scoped data OR a
+        # gradio log, not both.
+        gradio_id           = params.get("gradio_id", [None])[0]
+        gradio_log_size     = int(params.get("gradio_log_size", [0])[0])
+
+        seq = 0
+
+        # Resolve once; if it changes (user switches runs in the UI), the
+        # client closes this stream and opens a new one with the new run_id.
+        resolved_run_id = self._resolve_run_id(run_id) if run_id else None
+
+        def _etag(obj) -> str:
+            return hashlib.md5(
+                json.dumps(obj, sort_keys=True, default=str).encode()
+            ).hexdigest()
+
+        try:
+            while True:
+                payload = {}
+
+                # ── runs (etag-gated; only ship if changed) ─────────
+                # Exclude noise fields that mutate every second during
+                # training (log_mtime, last_seen, …) — those don't affect
+                # the tab rendering. Hash only display-relevant subset so
+                # most ticks have a stable etag and skip the payload.
+                # Skipped entirely when client passed runs_etag=__skip__.
+                if not skip_runs:
+                    runs = self._get_runs()
+                    etag_view = [
+                        {k: r.get(k) for k in (
+                            "id", "display_name", "status", "active",
+                            "max_steps", "step_offset", "gpu", "base_model",
+                            "dataset_id", "created_at",
+                        )}
+                        for r in runs
+                    ]
+                    new_runs_etag = _etag(etag_view)
+                    if new_runs_etag != runs_etag:
+                        payload["runs"] = runs
+                        payload["runs_etag"] = new_runs_etag
+                        runs_etag = new_runs_etag
+
+                if resolved_run_id:
+                    # ── status (cheap, often changes; gate on payload identity) ─
+                    try:
+                        status = self._get_status(resolved_run_id)
+                        status_blob = json.dumps(status, sort_keys=True, default=str)
+                        if status_blob != last_status_blob:
+                            payload["status"] = status
+                            last_status_blob = status_blob
+                    except Exception:
+                        pass
+
+                    # ── log delta ─
+                    try:
+                        log_delta = self._get_log_tail(resolved_run_id, file_size=log_size)
+                        if log_delta.get("log_tail"):
+                            payload["log"] = log_delta
+                            log_size = log_delta.get("file_size", log_size)
+                        elif log_delta.get("file_size", log_size) != log_size:
+                            # first connect / replay — sync size even without content
+                            log_size = log_delta.get("file_size", log_size)
+                    except Exception:
+                        pass
+
+                    # ── loss_by_timestep (file-size-gated) ─
+                    try:
+                        lbt = self._get_loss_by_timestep(resolved_run_id)
+                        if lbt and lbt.get("file_size", 0) != lbt_size:
+                            payload["lbt"] = lbt
+                            lbt_size = lbt.get("file_size", 0)
+                    except Exception:
+                        pass
+
+                    # ── checkpoints (etag-gated) ─
+                    try:
+                        ckpts = self._get_checkpoints(resolved_run_id)
+                        e = _etag(ckpts)
+                        if e != last_ckpts_etag:
+                            payload["checkpoints"] = ckpts
+                            last_ckpts_etag = e
+                    except Exception:
+                        pass
+
+                    # ── demos: kick the throttled processor for active runs,
+                    # then ship the cached listing. Mirror /api/demos's 10s
+                    # throttle to avoid hammering the demo pipeline. ─
+                    try:
+                        now = time.time()
+                        run = registry.get_run(resolved_run_id)
+                        if (run and run.get("status") in ("training", "demos")
+                                and now >= next_demo_kick):
+                            next_demo_kick = now + 10
+                            last_kick = DashboardHandler._demo_process_times.get(
+                                resolved_run_id, 0)
+                            if now - last_kick >= 10:
+                                DashboardHandler._demo_process_times[resolved_run_id] = now
+                                threading.Thread(
+                                    target=_process_run_demos, args=(run,),
+                                    daemon=True
+                                ).start()
+                        demos = self._get_demos(resolved_run_id)
+                        e = _etag(demos)
+                        if e != last_demos_etag:
+                            payload["demos"] = demos
+                            last_demos_etag = e
+                    except Exception:
+                        pass
+
+                # ── gradio instances (etag-gated; not run-scoped) ─
+                try:
+                    gradio_list = gradio_manager.list_instances()
+                    for inst in gradio_list:
+                        lp = inst.get("log_path")
+                        inst["log_mtime"] = (
+                            os.path.getmtime(lp) if lp and os.path.exists(lp) else None
+                        )
+                    # Etag from a stable subset — exclude log_mtime which
+                    # churns; only resend when an instance is added / removed
+                    # or its status changes.
+                    g_etag_view = [
+                        {k: g.get(k) for k in
+                         ("id", "status", "run_id", "checkpoint_path",
+                          "gpu", "port", "pid", "share_url", "error", "title")}
+                        for g in gradio_list
+                    ]
+                    e = _etag(g_etag_view)
+                    if e != last_gradio_etag:
+                        payload["gradio"] = gradio_list
+                        last_gradio_etag = e
+                except Exception:
+                    pass
+
+                # ── gpu (values change every tick; etag-gate anyway since
+                # idle GPUs stay flat for long stretches) ─
+                try:
+                    gpu_info = self._get_gpu_info()
+                    e = _etag(gpu_info)
+                    if e != last_gpu_etag:
+                        payload["gpu"] = gpu_info
+                        last_gpu_etag = e
+                except Exception:
+                    pass
+
+                # ── gradio log for a specific instance (Log Explorer modal) ─
+                # Gradio logs use \r for tqdm-style in-place updates and need
+                # collapsing across the whole file, so we re-read in full
+                # when the file size changes (gradio logs stay small).
+                if gradio_id:
+                    try:
+                        inst = next(
+                            (i for i in gradio_manager.list_instances()
+                             if i["id"] == gradio_id),
+                            None,
+                        )
+                        lp = inst.get("log_path") if inst else None
+                        if lp and os.path.exists(lp):
+                            file_size = os.path.getsize(lp)
+                            if file_size != gradio_log_size:
+                                with open(lp, "rb") as f:
+                                    raw = f.read()
+                                lines = []
+                                for chunk in raw.split(b"\n"):
+                                    if b"\r" in chunk:
+                                        chunk = chunk.rsplit(b"\r", 1)[-1]
+                                    line = chunk.decode("utf-8", errors="replace")
+                                    if line:
+                                        lines.append(line)
+                                lines = _collapse_progress_lines(lines)
+                                payload["gradio_log"] = {
+                                    "instance_id": gradio_id,
+                                    "content":     "\n".join(lines[-1000:]),
+                                    "file_size":   file_size,
+                                    "mtime":       os.path.getmtime(lp),
+                                }
+                                gradio_log_size = file_size
+                    except Exception:
+                        pass
+
+                # ── write the SSE frame ──
+                if payload:
+                    seq += 1
+                    line = (
+                        f"id: {seq}\n"
+                        f"data: {json.dumps(payload, default=str)}\n\n"
+                    )
+                    self.wfile.write(line.encode())
+                else:
+                    # heartbeat — comment line, ignored by EventSource,
+                    # keeps the connection alive through idle proxies
+                    self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+
+                time.sleep(1)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return  # client disconnected — clean exit, thread ends
 
     def _serve_audio(self, rel_path, dl_name=None):
         fpath = AUDIO_DIR / rel_path
@@ -6010,6 +6260,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 for i in range(n_bins)
             ],
             "total_entries": n_entries,
+            "file_size": file_size,
         }
 
         # bin_raw stays in the cache so the next call can append-only.

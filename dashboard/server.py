@@ -3171,7 +3171,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if not cached:
                 input_dir = ds.get("input_dir", "")
                 if input_dir and Path(input_dir).is_dir():
-                    file_info, total_files, files_with_tags, files_with_json = self._scan_audio_tags(
+                    file_info, total_files, files_with_tags, files_with_json, _csv_count = self._scan_audio_tags(
                         input_dir, sample_size=None, tag_sample_size=None)
                     _save_tag_cache(ds_id, file_info, total_files, files_with_tags, files_with_json)
                 else:
@@ -5255,12 +5255,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         ``tag_sample_size`` files (expensive I/O).  ``sample_size`` controls
         how many files are *returned* — ``None`` means return all.
         ``progress_fn(phase, current, total)`` is called periodically.
-        Returns (file_info_list, total_files, files_with_tags, files_with_json).
+        Returns (file_info_list, total_files, files_with_tags,
+        files_with_json, csv_count).
         """
         p = Path(dir_path).expanduser().resolve()
         audio_files = []
         # Collect ALL .json files for cross-directory sidecar matching
         json_files = {}  # stem -> list of absolute Paths
+        # Just a count of .csv files — underfit doesn't parse CSV metadata,
+        # but if the user has them in the directory they're probably *trying*
+        # to provide metadata. The UI surfaces this so the user is told,
+        # rather than silently leaving the CSV unused.
+        csv_count = 0
         if progress_fn:
             progress_fn("walking", 0, 0)
         for dirpath_, _, filenames in os.walk(p):
@@ -5269,9 +5275,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 fp = dp / fn
                 if _is_audio_file(fp):
                     audio_files.append(fp)
-                elif fn.lower().endswith(".json"):
-                    stem = Path(fn).stem
-                    json_files.setdefault(stem, []).append(fp)
+                else:
+                    low = fn.lower()
+                    if low.endswith(".json"):
+                        stem = Path(fn).stem
+                        json_files.setdefault(stem, []).append(fp)
+                    elif low.endswith(".csv"):
+                        csv_count += 1
             if progress_fn and len(audio_files) % 100 < len(filenames):
                 progress_fn("walking", len(audio_files), 0)
         audio_files.sort()
@@ -5333,7 +5343,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 "has_json": has_json,
                 "duration": dur,
             })
-        return file_info, total, files_with_tags, files_with_json
+        return file_info, total, files_with_tags, files_with_json, csv_count
 
     # ── Pre-encoded dataset import ───────────────────────────────────────
     # When the user pastes a directory of .npy files into the New Dataset
@@ -5693,7 +5703,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return
 
         # ── Raw-audio scan flow (existing behaviour) ──
-        file_info, total_files, files_with_tags, files_with_json = \
+        file_info, total_files, files_with_tags, files_with_json, csv_count = \
             self._scan_audio_tags(str(p), sample_size=None,
                                   tag_sample_size=None,
                                   progress_fn=send_progress)
@@ -5711,6 +5721,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "total_files": total_files,
             "files_with_tags": files_with_tags,
             "files_with_json": files_with_json,
+            "csv_count": csv_count,
         })
         self.wfile.write(result.encode() + b"\n")
         self.wfile.flush()
@@ -5942,7 +5953,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             ds_id += f"-{datetime.now().strftime('%H%M%S')}"
 
         # Cache tag metadata at creation time (scan all files, read all tags)
-        file_info, _, files_with_tags, files_with_json = self._scan_audio_tags(
+        file_info, _, files_with_tags, files_with_json, _csv_count = self._scan_audio_tags(
             str(input_path), sample_size=None, tag_sample_size=None)
         # Filter out excluded files from tag cache
         if exclude_set:

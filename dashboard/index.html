@@ -1474,6 +1474,7 @@
     <!-- Step 2b: Needs encoding -->
     <div id="ds-step2b" style="display:none">
       <div style="color:var(--text2);font-size:0.8em;margin-bottom:8px" id="ds-file-summary"></div>
+      <div id="ds-csv-warning" style="display:none;padding:8px 12px;background:rgba(249,115,22,0.1);border-left:3px solid var(--orange);color:var(--text);font-size:0.85em;margin-bottom:10px;line-height:1.4"></div>
       <div class="ds-file-list" id="ds-file-list" style="max-height:35vh"></div>
       <div style="display:grid;grid-template-columns:1fr auto;gap:12px;margin-bottom:8px">
         <div>
@@ -7054,6 +7055,23 @@ window.scanDatasetDir = async function() {
     {
       const summ = `${data.total_files} audio files (${data.files_with_tags} with tags, ${data.files_with_json} with JSON sidecars)`;
       document.getElementById('ds-file-summary').textContent = summ;
+
+      // ── CSV-files warning ───────────────────────────────────────────
+      // underfit doesn't parse .csv metadata. If we found any, surface a
+      // note so the user knows their CSVs aren't being read and points
+      // them at the README's "Add metadata for prompts" section.
+      const csvWarn = document.getElementById('ds-csv-warning');
+      const csvCount = data.csv_count || 0;
+      if (csvCount > 0) {
+        csvWarn.innerHTML =
+          `<strong>${csvCount} <code>.csv</code> file${csvCount === 1 ? '' : 's'} detected but not parsed.</strong> ` +
+          `Underfit only reads metadata from JSON sidecars, plain <code>.txt</code> sidecars, or embedded ID3/Vorbis tags. ` +
+          `If you want per-clip prompts, convert your CSV to one of those formats. ` +
+          `<a href="https://github.com/dada-bots/underfit/#2-optional-add-metadata-for-prompts" target="_blank" rel="noopener" style="color:var(--accent2);text-decoration:underline">See supported methods →</a>`;
+        csvWarn.style.display = '';
+      } else {
+        csvWarn.style.display = 'none';
+      }
       let listHtml = '';
       for (let fi = 0; fi < data.audio_files.length; fi++) {
         const f = data.audio_files[fi];

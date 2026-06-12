@@ -453,12 +453,18 @@
     #stat-hyperparams, #stat-dataset { grid-column: 1 / -1; }
   }
 
-  /* Run tabs */
-  .run-tabs {
-    display: flex; gap: 0; overflow-x: auto; overflow-y: hidden;
+  /* Run tabs — wrapper holds the layout-toggle (left of scroll area) + the
+     horizontally-scrolling tabs. Toggle is outside the scroll so tabs can't
+     slide behind it. */
+  .run-tabs-row {
+    display: flex; align-items: stretch; gap: 0;
     max-width: 1400px; margin: 8px auto -1px; padding: 0 24px;
   }
-  .run-tabs { scrollbar-width: none; -ms-overflow-style: none; }
+  .run-tabs {
+    display: flex; gap: 0; flex: 1;
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: none; -ms-overflow-style: none;
+  }
   .run-tabs::-webkit-scrollbar { display: none; }
   .run-tab {
     padding: 8px 18px; background: var(--bg3); border: 1px solid var(--border);
@@ -475,6 +481,44 @@
   }
   .run-tab.dragging { opacity: 0.4; }
   .run-tab.drag-over { border-left: 3px solid var(--accent2); }
+  /* Layout toggle (horizontal ⮀ ↔ vertical ⮁) — first child of .run-tabs-row,
+     sibling of the scrolling .run-tabs so tabs can't pass behind it. */
+  .run-tabs-toggle {
+    background: var(--bg3); border: 1px solid var(--border);
+    color: var(--text2); font-family: inherit; font-size: 1.05em; cursor: pointer;
+    padding: 4px 12px; border-radius: 6px 6px 0 0; margin-right: 6px;
+    flex-shrink: 0; line-height: 1; transition: all 0.15s;
+  }
+  .run-tabs-toggle:hover { color: var(--accent2); background: var(--bg2); }
+
+  /* Vertical-runs mode — left fixed sidebar, shifts the rest of the page right. */
+  body.vertical-runs { padding-left: 260px; }
+  body.vertical-runs .run-tabs-row {
+    position: fixed; left: 0; top: 0; bottom: 0; width: 260px;
+    max-width: none; margin: 0; padding: 0;
+    flex-direction: column; overflow: hidden;
+    background: var(--bg); border-right: 1px solid var(--border);
+    z-index: 100;
+  }
+  body.vertical-runs .run-tabs {
+    flex: 1; flex-direction: column;
+    overflow-x: hidden; overflow-y: auto;
+  }
+  body.vertical-runs .run-tab {
+    padding: 10px 14px; border: none; border-bottom: 1px solid var(--border);
+    border-radius: 0; margin: 0; width: 100%; text-align: left;
+    font-size: 0.85em;
+  }
+  body.vertical-runs .run-tab.active {
+    border-bottom: 1px solid var(--border); margin-bottom: 0;
+    background: rgba(124,58,237,0.15);
+  }
+  body.vertical-runs .run-tab.drag-over { border-left: none; border-top: 3px solid var(--accent2); }
+  body.vertical-runs .run-tabs-toggle {
+    width: 100%; padding: 12px 14px; border: none; border-bottom: 1px solid var(--border);
+    border-radius: 0; margin: 0; font-size: 1.25em; text-align: center;
+    background: var(--bg2);
+  }
   /* Checkpoint rows with inline Gradio */
   .ckpt-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.8em; flex-wrap: wrap; transition: background 1.5s ease-out; }
   .ckpt-row:last-child { border-bottom: none; }
@@ -996,7 +1040,10 @@
       </div>
     </div>
   </div>
-  <div class="run-tabs" id="run-tabs"></div>
+  <div class="run-tabs-row" id="run-tabs-row">
+    <button class="run-tabs-toggle" id="run-tabs-toggle" onclick="toggleRunsLayout()" title="Switch to vertical tabs">⮀</button>
+    <div class="run-tabs" id="run-tabs"></div>
+  </div>
 </div>
 
 <div class="main">
@@ -3530,10 +3577,42 @@ async function loadRuns() {
   }
 }
 
+// Runs layout: 'horizontal' (default, top tab strip) or 'vertical' (left sidebar).
+let _runsLayout = (function() {
+  try { return localStorage.getItem('underfit:runsLayout') || 'horizontal'; }
+  catch (_) { return 'horizontal'; }
+})();
+function _applyRunsLayout() {
+  document.body.classList.toggle('vertical-runs', _runsLayout === 'vertical');
+  const tBtn = document.getElementById('run-tabs-toggle');
+  if (tBtn) {
+    tBtn.innerHTML = (_runsLayout === 'horizontal') ? '⮀' : '⮁';
+    tBtn.title = (_runsLayout === 'horizontal') ? 'Switch to vertical tabs' : 'Switch to horizontal tabs';
+  }
+}
+_applyRunsLayout();
+window.toggleRunsLayout = function() {
+  _runsLayout = (_runsLayout === 'horizontal') ? 'vertical' : 'horizontal';
+  try { localStorage.setItem('underfit:runsLayout', _runsLayout); } catch (_) {}
+  _applyRunsLayout();
+  // Reset the off-axis scroll — leftover scrollLeft from horizontal mode
+  // would otherwise visually offset the vertical column (and vice versa).
+  const rt = document.getElementById('run-tabs');
+  if (rt) {
+    if (_runsLayout === 'vertical') rt.scrollLeft = 0;
+    else rt.scrollTop = 0;
+  }
+  // Re-render so DOM iteration order matches the new visual order,
+  // then renderTabs' own mode-aware scrollIntoView centers the active tab.
+  renderTabs();
+};
+
 function renderTabs() {
   const container = document.getElementById('run-tabs');
   container.innerHTML = '';
-  for (const run of runsData) {
+  // Vertical mode reverses iteration so newest is at the top (visually + in DOM).
+  const ordered = (_runsLayout === 'vertical') ? runsData.slice().reverse() : runsData;
+  for (const run of ordered) {
     const btn = document.createElement('button');
     btn.className = 'run-tab' + (run.id === currentRunId ? ' active' : '');
     btn.setAttribute('data-run-id', run.id);
@@ -3578,9 +3657,15 @@ function renderTabs() {
     });
     container.appendChild(btn);
   }
-  // Scroll active tab into view
+  // Scroll active tab into view — center on the scrollable axis for whichever
+  // orientation is active. `nearest` on the off-axis avoids extraneous scroll.
   const activeTab = container.querySelector('.run-tab.active');
-  if (activeTab) activeTab.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'instant' });
+  if (activeTab) {
+    const opts = (_runsLayout === 'vertical')
+      ? { block: 'center', inline: 'nearest', behavior: 'instant' }
+      : { inline: 'center', block: 'nearest', behavior: 'instant' };
+    activeTab.scrollIntoView(opts);
+  }
 }
 
 // Set of run IDs whose Console Output state has been "settled" for this

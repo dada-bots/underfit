@@ -148,6 +148,23 @@ def _apply_advanced_training_overrides(cfg, body):
          .setdefault("diffusion", {}).setdefault("optimizer", {})
          .setdefault("config", {}))["weight_decay"] = float(weight_decay)
 
+    # Best-checkpoint tracking: saves a copy of the regular checkpoint as
+    # "best" whenever an EMA of the training loss hits a new low (after an
+    # optional warmup), keeping only the most recent N best files. See
+    # _BestCheckpointTracker in underfit/training/loop.py. Off by default —
+    # only touched if the request explicitly includes the enabled flag
+    # (checkbox semantics: always present as true/false, never blank).
+    if "best_checkpoint_enabled" in body:
+        training_cfg["best_checkpoint_enabled"] = bool(body["best_checkpoint_enabled"])
+
+    best_ckpt_warmup = body.get("best_checkpoint_warmup_steps")
+    if best_ckpt_warmup not in (None, ""):
+        training_cfg["best_checkpoint_warmup_steps"] = int(best_ckpt_warmup)
+
+    best_ckpt_keep_n = body.get("best_checkpoint_keep_n")
+    if best_ckpt_keep_n not in (None, ""):
+        training_cfg["best_checkpoint_keep_n"] = int(best_ckpt_keep_n)
+
     timestep_sampler = body.get("timestep_sampler")
     if timestep_sampler:
         if timestep_sampler not in _VALID_TIMESTEP_SAMPLERS:

@@ -1276,6 +1276,24 @@
             </select>
           </div>
         </div>
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">
+          <label class="modal-label">Best checkpoint tracking</label>
+          <select class="resume-input" id="resume-best-ckpt-enabled" onchange="document.getElementById('resume-best-ckpt-row').style.display = this.value === 'true' ? 'grid' : 'none'">
+            <option value="">default (keep current)</option>
+            <option value="true">enabled</option>
+            <option value="false">disabled</option>
+          </select>
+          <div id="resume-best-ckpt-row" style="display:none;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
+            <div>
+              <label class="modal-label">Best-ckpt warmup steps</label>
+              <input type="number" class="resume-input" id="resume-best-ckpt-warmup" value="" min="0" placeholder="default (keep current)" oninput="validateResume()">
+            </div>
+            <div>
+              <label class="modal-label">Keep last N best</label>
+              <input type="number" class="resume-input" id="resume-best-ckpt-keep-n" value="" min="1" placeholder="default (keep current)" oninput="validateResume()">
+            </div>
+          </div>
+        </div>
       </details>
       <div class="resume-error" id="resume-error"></div>
       <div class="modal-actions" style="margin-top:16px">
@@ -1445,6 +1463,22 @@
               <option value="sample">sample</option>
               <option value="sample_channel">sample_channel</option>
             </select>
+          </div>
+        </div>
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">
+          <label style="display:flex;align-items:center;gap:6px;font-size:0.85em;cursor:pointer">
+            <input type="checkbox" id="new-ft-best-ckpt-enabled" onchange="document.getElementById('new-ft-best-ckpt-row').style.display = this.checked ? 'grid' : 'none'">
+            Save best checkpoint (by EMA-smoothed training loss)
+          </label>
+          <div id="new-ft-best-ckpt-row" style="display:none;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
+            <div>
+              <label class="modal-label">Best-ckpt warmup steps</label>
+              <input type="number" class="resume-input" id="new-ft-best-ckpt-warmup" value="1000" min="0" oninput="validateNewFt()">
+            </div>
+            <div>
+              <label class="modal-label">Keep last N best</label>
+              <input type="number" class="resume-input" id="new-ft-best-ckpt-keep-n" value="5" min="1" oninput="validateNewFt()">
+            </div>
           </div>
         </div>
       </details>
@@ -4735,6 +4769,12 @@ window.confirmResume = async function() {
   if (timestepSampler) payload.timestep_sampler = timestepSampler;
   const lossNormalization = document.getElementById('resume-loss-normalization').value;
   if (lossNormalization) payload.loss_normalization = lossNormalization;
+  const bcEnabledStr = document.getElementById('resume-best-ckpt-enabled').value;
+  if (bcEnabledStr) payload.best_checkpoint_enabled = bcEnabledStr === 'true';
+  const bcWarmup = document.getElementById('resume-best-ckpt-warmup').value.trim();
+  if (bcWarmup) payload.best_checkpoint_warmup_steps = parseInt(bcWarmup, 10);
+  const bcKeepN = document.getElementById('resume-best-ckpt-keep-n').value.trim();
+  if (bcKeepN) payload.best_checkpoint_keep_n = parseInt(bcKeepN, 10);
   if (!isNaN(cropLen) && cropLen > 0) payload.latent_crop_length = cropLen;
   payload.random_crop = cropMode === 'random';
   try {
@@ -6283,6 +6323,13 @@ window.confirmNewFinetune = async function() {
   if (timestepSampler) payload.timestep_sampler = timestepSampler;
   const lossNormalization = document.getElementById('new-ft-loss-normalization').value;
   if (lossNormalization) payload.loss_normalization = lossNormalization;
+  payload.best_checkpoint_enabled = document.getElementById('new-ft-best-ckpt-enabled').checked;
+  if (payload.best_checkpoint_enabled) {
+    const bcWarmup = document.getElementById('new-ft-best-ckpt-warmup').value.trim();
+    if (bcWarmup) payload.best_checkpoint_warmup_steps = parseInt(bcWarmup, 10);
+    const bcKeepN = document.getElementById('new-ft-best-ckpt-keep-n').value.trim();
+    if (bcKeepN) payload.best_checkpoint_keep_n = parseInt(bcKeepN, 10);
+  }
   const basePrecision = document.getElementById('new-ft-base-precision').value;
   if (basePrecision) payload.base_precision = basePrecision;
   if (datasetId) payload.dataset_id = datasetId;

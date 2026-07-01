@@ -176,37 +176,32 @@ class _LossByTimestepLog:
 
 
 class _BestCheckpointTracker:
-    """Tracks an EMA of the training loss and saves a copy of the regular
-    checkpoint as a "best" checkpoint whenever the EMA hits a new low.
+    """Tracks an EMA of the training loss and saves a best checkpoint
+    whenever the EMA hits a new low at the end of each epoch (after an
+    optional warmup period). Keeps only the last `keep_n` best files.
 
     Design notes:
-      - Compares an EMA of per-step loss, not raw per-step loss — raw loss
-        is too noisy (see dashboard's Loss chart: raw spikes constantly,
-        the smoothed line is what actually trends down). Comparing raw
-        loss would make "best" mostly a function of which step happened to
-        sample an easy batch, not genuine improvement.
-      - Only compares at the existing checkpoint-save cadence (save_every),
-        not every step — cheap, and matches the granularity a human would
-        actually look at.
-      - `best_so_far` is recovered from the resumed checkpoint's metadata
-        (every checkpoint stamps the current best, not just literal-best
-        ones — see save_lora_step's best_ema_loss kwarg), so resuming a
-        run doesn't reset progress and accidentally overwrite a real best
-        with a worse one.
-      - Reuses the just-written regular checkpoint file via a copy rather
-        than re-computing+re-saving the state dict a second time — the
-        regular save already captured the exact state at this step.
-      - Keeps only the last `keep_n` best files (oldest deleted first);
-        underfit has no separate validation loss, so this is a train-loss
-        proxy for "best" — it can still reflect overfitting to the
-        training set, not genuine held-out generalization.
+      - Checked at each epoch boundary (not per-step and not only at
+        interval checkpoints) — gives finer granularity than save_every
+        without the cost of writing on every single step.
+      - Compares an EMA of per-step loss, not raw loss — raw loss is too
+        noisy; a single lucky batch would trigger a spurious "best."
+      - `best_so_far` survives a resume: every regular checkpoint stamps
+        the current best into its safetensors metadata (best_ema_loss
+        kwarg on save_lora_step), so resuming from any checkpoint recovers
+        the right value without a separate sidecar file.
+      - Does its own save_lora_step call (not a copy of a regular
+        checkpoint) since epoch boundaries don't align with save_every.
+      - Keeps only the last `keep_n` best files (oldest deleted first).
+      - underfit has no validation loss, so this is a train-loss proxy —
+        it can reflect overfitting, not genuine held-out generalization.
     """
     def __init__(self, *, alpha=0.05, warmup_steps=0, keep_n=5, best_so_far=None):
         self.alpha = alpha
         self.warmup_steps = warmup_steps
         self.keep_n = keep_n
         self.ema_loss = None
-        self.best_so_far = best_so_far  # None until warmup passes and we've seen at least one value
+        self.best_so_far = best_so_far
         self._saved_paths = []  # oldest-first, for rotation
 
     def update(self, loss_value):
@@ -216,10 +211,11 @@ class _BestCheckpointTracker:
         else:
             self.ema_loss = self.alpha * loss_value + (1 - self.alpha) * self.ema_loss
 
-    def maybe_save_best(self, *, global_step, regular_ckpt_path, checkpoint_dir, run_label):
-        """Call only at regular checkpoint-save points (after the regular
-        save has happened). Returns the best-checkpoint path if a new best
-        was saved this call, else None.
+    def maybe_save_best(self, *, backend, model, saved_lora_cfg, base_model_name,
+                        global_step, epoch, checkpoint_dir, run_label):
+        """Call at each epoch boundary. If the current EMA loss is a new
+        low (and warmup has passed), saves a best checkpoint via its own
+        save_lora_step call. Returns the saved path, or None if skipped.
         """
         if self.ema_loss is None or global_step < self.warmup_steps:
             return None
@@ -228,10 +224,15 @@ class _BestCheckpointTracker:
             return None
         self.best_so_far = self.ema_loss
 
-        best_name = f"{run_label}-best-step={global_step}.safetensors" if run_label \
-            else f"best-step={global_step}.safetensors"
-        best_path = os.path.join(checkpoint_dir, best_name)
-        shutil.copy2(regular_ckpt_path, best_path)
+        best_dir = os.path.join(checkpoint_dir, "best")
+        os.makedirs(best_dir, exist_ok=True)
+        best_name = (f"{run_label}-best-step={global_step}-epoch={epoch}.safetensors"
+                     if run_label else f"best-step={global_step}-epoch={epoch}.safetensors")
+        best_path = os.path.join(best_dir, best_name)
+
+        save_lora_step(backend, model, saved_lora_cfg, best_path,
+                       step=global_step, epoch=epoch, base_model=base_model_name,
+                       best_ema_loss=self.best_so_far)
         self._saved_paths.append(best_path)
 
         while len(self._saved_paths) > self.keep_n:
@@ -779,15 +780,6 @@ def run_training(args, backend):
                                             base_model=base_model_name, best_ema_loss=current_best)
                             print(f"✓ Saved checkpoint -- {os.path.basename(out)}", flush=True)
 
-                            if best_tracker is not None:
-                                best_path = best_tracker.maybe_save_best(
-                                    global_step=global_step, regular_ckpt_path=out,
-                                    checkpoint_dir=checkpoint_dir, run_label=run_label,
-                                )
-                                if best_path:
-                                    print(f"  ★ New best (EMA loss={best_tracker.best_so_far:.6f}) -- "
-                                          f"{os.path.basename(best_path)}", flush=True)
-
                         if demo_will_fire:
                             last_demo_step = global_step
                             try:
@@ -809,6 +801,18 @@ def run_training(args, backend):
 
                 if raw_step >= max_steps:
                     break
+
+            # --- End of epoch: check for new best checkpoint ---
+            if best_tracker is not None and checkpoint_dir:
+                best_path = best_tracker.maybe_save_best(
+                    backend=backend, model=model,
+                    saved_lora_cfg=saved_lora_cfg, base_model_name=base_model_name,
+                    global_step=global_step, epoch=epoch,
+                    checkpoint_dir=checkpoint_dir, run_label=run_label,
+                )
+                if best_path:
+                    print(f"  ★ New best (EMA loss={best_tracker.best_so_far:.6f}, "
+                          f"epoch={epoch}) -- {os.path.basename(best_path)}", flush=True)
             epoch += 1
 
         # Final save (skip if the last regular save already covered this
@@ -827,7 +831,9 @@ def run_training(args, backend):
 
             if best_tracker is not None:
                 best_path = best_tracker.maybe_save_best(
-                    global_step=global_step, regular_ckpt_path=out,
+                    backend=backend, model=model,
+                    saved_lora_cfg=saved_lora_cfg, base_model_name=base_model_name,
+                    global_step=global_step, epoch=epoch,
                     checkpoint_dir=checkpoint_dir, run_label=run_label,
                 )
                 if best_path:

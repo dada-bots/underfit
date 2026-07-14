@@ -64,6 +64,8 @@ try:
             if torch.cuda.is_available():
                 _f.write(f"device: {torch.cuda.get_device_name(0)} "
                          f"(sm{''.join(map(str, torch.cuda.get_device_capability(0)))})\n")
+            elif torch.backends.mps.is_available():
+                _f.write("device: mps (Apple Silicon)\n")
         except Exception as _e:
             _f.write(f"torch import failed: {type(_e).__name__}: {_e}\n")
 except Exception:

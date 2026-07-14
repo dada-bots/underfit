@@ -25,6 +25,7 @@ from tqdm import tqdm
 # callbacks.py), in this venv. Lazy import resolves the order at call time.
 
 from underfit.utils import compute_per_elem_trim, trim_and_concat
+from underfit.utils.device import autocast_context, empty_device_cache
 
 
 _APP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -98,7 +99,7 @@ def _generate_single_sample(
     """Generate one decoded audio clip. Returns CPU int16 [C, T]."""
     per_elem_trim = compute_per_elem_trim(cond_list, sample_rate)
 
-    with torch.amp.autocast("cuda"):
+    with autocast_context(next(model.parameters()).device):
         # Delegate to backend.demo_sample so each backend can apply its own
         # alignment / padding-mask conventions. SA3 routes through the
         # StableAudioPipeline (chunk-aligns latent length, applies
@@ -174,7 +175,7 @@ def _generate_split_lora_sample(
 
     set_lora_strength(model.model, lora_strength, lora_index=0)
 
-    with torch.amp.autocast("cuda"):
+    with autocast_context(device):
         conditioning = backend.encode_conditioning(model, cond_list, device)
         inpaint_zeros = _build_inpaint_zeros(model, duration_latents, device, model_dtype)
         if inpaint_zeros is not None:
@@ -555,8 +556,7 @@ def run_demo_step(model, backend, demo_config, step, sample_size, sample_rate, d
     finally:
         model.train()
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        empty_device_cache()
 
 
 def _run_one_arc_entry(model, backend, entry, i, step, sample_rate, ds_ratio,

@@ -620,15 +620,19 @@ def main():
 
     # --- Determine GPU count --------------------------------------------------
 
-    if args.device == "cpu":
+    if args.device in ("cpu", "mps"):
         num_gpus = 1
     elif args.device.startswith("cuda:"):
         num_gpus = 1   # specific GPU requested
     else:
         num_gpus = torch.cuda.device_count()
         if num_gpus == 0:
-            print("No CUDA GPUs found, falling back to CPU")
-            args.device = "cpu"
+            if torch.backends.mps.is_available():
+                print("No CUDA GPUs found, using MPS (Apple Silicon)")
+                args.device = "mps"
+            else:
+                print("No CUDA GPUs found, falling back to CPU")
+                args.device = "cpu"
             num_gpus = 1
 
     if args.num_gpus is not None:
@@ -727,7 +731,12 @@ def main():
         batch_size = 1
     else:
         try:
-            gpu_mem_mb = torch.cuda.get_device_properties(0).total_mem / 1024**2
+            if args.device == "mps":
+                # Unified memory: budget from system RAM, not CUDA VRAM.
+                # Halve it since the OS + apps share the same pool.
+                gpu_mem_mb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / 1024**2 / 2
+            else:
+                gpu_mem_mb = torch.cuda.get_device_properties(0).total_mem / 1024**2
         except Exception:
             gpu_mem_mb = 40000  # conservative fallback
         target_mb = gpu_mem_mb * 0.50  # use at most 50% of VRAM

@@ -121,7 +121,7 @@ def load_state_into(model, state_dict, model_type=None):
     copy_state_dict(model, state_dict)
 
 
-def load_model(config_path, ckpt_path, device="cuda", half=False):
+def load_model(config_path, ckpt_path, device=None, half=False):
     """Load model + parsed config from disk paths.
 
     Composes SA3's public primitives directly (rather than using
@@ -135,16 +135,23 @@ def load_model(config_path, ckpt_path, device="cuda", half=False):
     from stable_audio_3.factory import create_diffusion_cond_from_config
     from stable_audio_3.loading_utils import remap_state_dict_keys
     from underfit.utils import stream_checkpoint_into_model
+    from underfit.utils.device import device_type_of, resolve_device
     with open(config_path) as f:
         model_config = json.load(f)
     _normalize_for_sa3(model_config)
-    if not torch.cuda.is_available():
+    # Requesting "cuda" on a CUDA-less host falls back to the best available
+    # device (mps > cpu) rather than erroring.
+    if device_type_of(device) == "cuda" and not torch.cuda.is_available():
+        device = None
+    device = resolve_device(device)
+    if device_type_of(device) == "cpu":
+        # fp16 inference on CPU is slow and numerically fragile; keep fp32.
         half = False
     model = create_diffusion_cond_from_config(model_config)
 
-    # Stream safetensors weights directly to GPU; fall back to bulk-load
-    # for .ckpt / .pt format (no mmap available there).
-    target_device = device if torch.cuda.is_available() else "cpu"
+    # Stream safetensors weights directly to the target device; fall back to
+    # bulk-load for .ckpt / .pt format (no mmap available there).
+    target_device = device
     target_dtype = torch.float16 if half else None
     result = stream_checkpoint_into_model(
         model, ckpt_path, device=target_device, dtype=target_dtype,
@@ -397,8 +404,9 @@ def create_gradio_ui(*, model_config_path=None, ckpt_path=None, pretrained_name=
     elif model_config_path and ckpt_path:
         # Same load + remap path as load_model() above so SAT-dev-trained
         # checkpoints with pretransform.model.* keys work.
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if not torch.cuda.is_available():
+        from underfit.utils.device import resolve_device
+        device = resolve_device()
+        if device == "cpu":
             model_half = False
         model, model_config = load_model(model_config_path, ckpt_path, device=device, half=model_half)
         pipe = StableAudioModel(model, model_config, device, model_half)

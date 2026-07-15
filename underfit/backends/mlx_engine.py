@@ -384,7 +384,7 @@ def _build_demo_entries(demo):
             entry = {"prompt": e.get("prompt", ""),
                      "cfg": e.get("cfg", default_cfg),
                      "steps": e.get("steps", default_steps)}
-        for k in ("seed", "lora_strength", "lora_interval_max"):
+        for k in ("seed", "lora_strength", "lora_interval_max", "duration"):
             if e.get(k) is not None:
                 entry[k] = e[k]
         entries.append(entry)

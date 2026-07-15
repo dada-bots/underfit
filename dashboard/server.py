@@ -6840,6 +6840,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         if not os.path.isdir(ckpt_subdir):
                             continue
                         for f in os.scandir(ckpt_subdir):
+                            if f.name.startswith("."):
+                                continue  # hidden scratch (e.g. .arc_demo_tmp — MLX ARC-demo temp LoRA)
                             if f.name.endswith(".safetensors"):
                                 all_ckpts[f.path] = (Path(f.path), f.stat())
                             elif f.name.endswith(".ckpt"):

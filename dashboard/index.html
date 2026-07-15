@@ -1928,6 +1928,8 @@ let _gpuModalCkptName = null;
 let _selectedGpu = null;
 let _pendingCkptHighlight = null;
 let _gpuData = [];
+let _platform = 'cuda';       // 'apple' | 'cuda' | 'cpu' — from /api/gpu
+let _engines = ['torch'];     // available training engines — from /api/gpu
 let _gradioVramEstimate = {load_mb: 10000, peak_mb: 12000, n_samples: 0};
 let _arcInfo = {};  // {model_key: {arc_type, diffusion_objective}}
 
@@ -3391,7 +3393,7 @@ window.openGpuModal = function(ckptPath, ckptName) {
     gpuGradioCount[g.gpu] = (gpuGradioCount[g.gpu] || 0) + 1;
   });
   if (_gpuData.length === 0) {
-    grid.innerHTML = '<div style="padding:8px 12px;color:var(--orange);font-size:0.85em;border:1px solid var(--orange);border-radius:6px;background:rgba(255,165,0,0.08);grid-column:1/-1">⚠ No CUDA GPUs detected — Gradio inference requires an NVIDIA GPU.</div>';
+    grid.innerHTML = _noGpuHtml('⚠ No CUDA GPUs detected — Gradio inference requires an NVIDIA GPU.', true);
     return;
   }
   const _numGpus = _gpuData.length;
@@ -3418,6 +3420,8 @@ window.openGpuModal = function(ckptPath, ckptName) {
     if (!hidden) btn.onclick = () => selectGpu(i);
     grid.appendChild(btn);
   }
+  // Non-CUDA single accelerator (Apple): default-select it so Launch enables without a click.
+  if (_platform !== 'cuda' && _numGpus === 1) selectGpu(0);
   document.getElementById('gpu-modal').classList.add('active');
 };
 
@@ -3782,16 +3786,55 @@ window.switchRun = async function(runId, skipPush) {
 };
 
 
+// Platform-aware "no device" message. Keeps the original CUDA wording verbatim
+// (so the cuda path is byte-identical); softer, non-blocking note on cpu.
+function _noGpuHtml(cudaMsg, gridColumn) {
+  const gc = gridColumn ? ';grid-column:1/-1' : '';
+  const style = 'padding:8px 12px;color:var(--orange);font-size:0.85em;border:1px solid var(--orange);border-radius:6px;background:rgba(255,165,0,0.08)' + gc;
+  const msg = (_platform === 'cuda')
+    ? cudaMsg
+    : '⚠ No GPU accelerator — running on CPU (slow).';
+  return '<div style="' + style + '">' + msg + '</div>';
+}
+
+// Filter/relabel the engine dropdown to the platform's available engines.
+// Idempotent — safe to call on every /api/gpu tick. Never clobbers a valid
+// user selection (only falls back when the current option becomes hidden).
+function _applyEngineOptions() {
+  const sel = document.getElementById('new-ft-engine');
+  if (!sel) return;
+  const hasMlx = _engines.includes('mlx');
+  const isApple = _platform === 'apple';
+  Array.from(sel.options).forEach(o => {
+    if (o.value === 'mlx') {
+      o.hidden = !hasMlx;
+      o.disabled = !hasMlx;
+      o.textContent = isApple ? 'MLX' : 'mlx';
+    } else if (o.value === 'torch') {
+      o.textContent = isApple ? 'MPS (PyTorch)' : 'torch';
+    }
+  });
+  const cur = sel.options[sel.selectedIndex];
+  if (!cur || cur.hidden || cur.disabled) {
+    sel.value = hasMlx ? 'mlx' : 'torch';
+  }
+}
+
 function _applyGpu(data) {
   try {
     const gpus = data.gpus || [];
+    _platform = data.platform || 'cuda';
+    _engines = data.engines || ['torch'];
+    window._platform = _platform;
+    window._engines = _engines;
+    _applyEngineOptions();
     if (data.gradio_estimate) _gradioVramEstimate = data.gradio_estimate;
     if (data.arc_info) _arcInfo = data.arc_info;
     _cudaVisibleDevices = data.cuda_visible_devices || null;
     _gpuData = gpus;
     const row = document.getElementById('gpu-row');
     if (gpus.length === 0) {
-      row.innerHTML = '<div style="padding:8px 12px;color:var(--orange);font-size:0.85em;border:1px solid var(--orange);border-radius:6px;background:rgba(255,165,0,0.08)">⚠ No CUDA GPUs detected. Training and encoding require an NVIDIA GPU with <code>nvidia-smi</code> available on PATH.</div>';
+      row.innerHTML = _noGpuHtml('⚠ No CUDA GPUs detected. Training and encoding require an NVIDIA GPU with <code>nvidia-smi</code> available on PATH.', false);
       return;
     }
     row.innerHTML = gpus.map(g => {
@@ -3848,11 +3891,16 @@ function _applyGpu(data) {
           }).join('')
         : (idle ? '<div class="gpu-label-text">idle</div>' : '');
       const activeClass = (_gpuVramPanelGpu === g.gpu) ? ' gpu-card-active' : '';
+      const isApple = g.kind === 'apple';
+      const idLabel = isApple ? escAttr(g.name || 'Apple GPU') : `GPU ${g.gpu}`;
+      const appleNote = isApple
+        ? `<div class="gpu-label-text" title="unified memory">${g.cores ? g.cores + '-core · ' : ''}unified memory</div>`
+        : '';
       return `<div class="gpu-card${activeClass}" data-gpu="${g.gpu}" style="cursor:pointer" onclick="toggleGpuVramPanel(${g.gpu})">
-        <div class="gpu-id">GPU ${g.gpu}</div>
+        <div class="gpu-id">${idLabel}</div>
         <div class="gpu-bar"><div class="gpu-bar-fill" style="width:${pct}%;background:${color}"></div></div>
         <div class="gpu-usage">${(g.used_mb/1024).toFixed(1)} / ${(g.total_mb/1024).toFixed(1)} GB</div>
-        ${labelsHtml}
+        ${isApple ? appleNote : labelsHtml}
       </div>`;
     }).join('');
     updateGpuVramChartLive();
@@ -5261,7 +5309,7 @@ function buildGpuGrid(gridId, selectFn) {
   grid.innerHTML = '';
   _buildCudaWarn(gridId);
   if (_gpuData.length === 0) {
-    grid.innerHTML = '<div style="padding:8px 12px;color:var(--orange);font-size:0.85em;border:1px solid var(--orange);border-radius:6px;background:rgba(255,165,0,0.08);grid-column:1/-1">⚠ No CUDA GPUs detected — training requires an NVIDIA GPU.</div>';
+    grid.innerHTML = _noGpuHtml('⚠ No CUDA GPUs detected — training requires an NVIDIA GPU.', true);
     return;
   }
   const _numGpus = _gpuData.length;
@@ -5271,6 +5319,7 @@ function buildGpuGrid(gridId, selectFn) {
     const usedMb = gpuInfo ? gpuInfo.used_mb : 0;
     const totalMb = gpuInfo ? gpuInfo.total_mb : 0;
     const labels = gpuInfo ? (gpuInfo.labels || []) : [];
+    const isApple = gpuInfo && gpuInfo.kind === 'apple';
     const pct = totalMb > 0 ? Math.round(usedMb / totalMb * 100) : 0;
     const barColor = pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--orange)' : 'var(--green)';
     const labelsHtml = labels.map(l => {
@@ -5278,15 +5327,21 @@ function buildGpuGrid(gridId, selectFn) {
     }).join('');
     const idle = labels.length === 0 && usedMb < 500;
     const idleHtml = idle ? '<div class="gpu-label-text">idle</div>' : '';
+    const appleNote = isApple
+      ? `<div class="gpu-label-text" title="unified memory">${gpuInfo.cores ? gpuInfo.cores + '-core · ' : ''}unified memory</div>`
+      : '';
+    const idLabel = isApple ? escAttr(gpuInfo.name || 'Apple GPU') : `GPU ${i}`;
     const hidden = !_isGpuVisible(i);
     btn.className = 'gpu-btn' + (hidden ? ' cuda-hidden' : '');
-    btn.innerHTML = `<div class="gpu-btn-id">GPU ${i}</div>` +
+    btn.innerHTML = `<div class="gpu-btn-id">${idLabel}</div>` +
       `<div class="gpu-bar"><div class="gpu-bar-fill" style="width:${pct}%;background:${barColor}"></div></div>` +
       `<div class="gpu-usage">${(usedMb/1024).toFixed(1)} / ${(totalMb/1024).toFixed(1)} GB</div>` +
-      (labelsHtml || idleHtml);
+      (isApple ? appleNote : (labelsHtml || idleHtml));
     if (!hidden) btn.onclick = () => selectFn(i);
     grid.appendChild(btn);
   }
+  // Non-CUDA single accelerator (Apple): default-select it so Start enables without a click.
+  if (_platform !== 'cuda' && _numGpus === 1 && typeof selectFn === 'function') selectFn(0);
 }
 
 // LoRA per-layer data — driven by lora_layer_template in /api/models response.
@@ -6018,6 +6073,9 @@ window.openNewFinetuneModal = async function() {
     if (_bmOptions.has(_pref)) { _bmEl.value = _pref; break; }
   }
   document.getElementById('new-ft-base-precision').value = 'fp16';
+  // Engine: default mlx on Apple, torch elsewhere (options filtered/relabeled by _applyEngineOptions).
+  _applyEngineOptions();
+  document.getElementById('new-ft-engine').value = _engines.includes('mlx') ? 'mlx' : 'torch';
   document.getElementById('new-ft-batch').value = '1';
   document.getElementById('new-ft-steps').value = '40000';
   document.getElementById('new-ft-lora-type').value = 'dora-rows';
@@ -7252,7 +7310,7 @@ function buildGpuGridMulti() {
   _buildCudaWarn('ds-gpu-grid');
   _dsSelectedGpus = new Set();
   if (_gpuData.length === 0) {
-    grid.innerHTML = '<div style="padding:8px 12px;color:var(--orange);font-size:0.85em;border:1px solid var(--orange);border-radius:6px;background:rgba(255,165,0,0.08);grid-column:1/-1">⚠ No CUDA GPUs detected — dataset encoding requires an NVIDIA GPU.</div>';
+    grid.innerHTML = _noGpuHtml('⚠ No CUDA GPUs detected — dataset encoding requires an NVIDIA GPU.', true);
     return;
   }
   const _numGpus = _gpuData.length;

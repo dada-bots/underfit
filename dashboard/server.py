@@ -607,8 +607,9 @@ def _kill_process_group(pid, paused=False):
 
 
 def _free_gpu_memory(gpu):
-    """Run cuda.empty_cache() on the specified GPU to free VRAM."""
-    if gpu is None:
+    """Run cuda.empty_cache() on the specified GPU to free VRAM. CUDA-only —
+    a no-op on Apple (MPS/MLX) / CPU, where there's no per-GPU CUDA cache."""
+    if gpu is None or _detect_platform() != "cuda":
         return
     try:
         cmd = (
@@ -1526,7 +1527,7 @@ class GradioManager:
             # a non-IPython subprocess (matplotlib crashes on import).
             cmd = (
                 f"source {_bash_quote(VENV_ACTIVATE)} && "
-                f"{backend_env}CUDA_VISIBLE_DEVICES={gpu} GRADIO_SERVER_PORT={port} "
+                f"{backend_env}{_cuda_env_prefix(gpu)}GRADIO_SERVER_PORT={port} "
                 f"PYTHONUNBUFFERED=1 MPLBACKEND=Agg "
                 f"{thread_env}"
                 f"python {_bash_quote(RUN_GRADIO_SCRIPT)} "
@@ -2214,7 +2215,7 @@ class TrainingMonitor:
                     if "--gradient-clip-val" not in restart_cmd:
                         restart_cmd += "     --gradient-clip-val 1.0"
                     # Restart training and append stdout/stderr to the log file.
-                    gpu_env = f"CUDA_VISIBLE_DEVICES={gpu} " if gpu is not None else ""
+                    gpu_env = _cuda_env_prefix(gpu)
                     backend_env = _backend_env_for_model(fresh_run.get("base_model"))
                     demo_dir = fresh_run.get("demo_source_dir", str(RUNS_DIR))
                     os.makedirs(demo_dir, exist_ok=True)
@@ -2629,6 +2630,92 @@ def _update_gradio_vram_estimates():
                 to_remove.append(iid)
         for iid in to_remove:
             _gradio_vram_baselines.pop(iid, None)
+
+
+_PLATFORM_CACHE = None
+
+
+def _detect_platform():
+    """Accelerator platform: 'apple' (Apple-Silicon / Metal — MPS + MLX),
+    'cuda' (nvidia-smi GPUs present), or 'cpu'. Torch-free so it works even when
+    the training backend isn't importable in this venv. Cached for the session."""
+    global _PLATFORM_CACHE
+    if _PLATFORM_CACHE is None:
+        import platform as _pf
+        if _pf.system() == "Darwin" and _pf.machine() == "arm64":
+            _PLATFORM_CACHE = "apple"
+        elif _get_gpu_count() > 0:
+            _PLATFORM_CACHE = "cuda"
+        else:
+            _PLATFORM_CACHE = "cpu"
+    return _PLATFORM_CACHE
+
+
+_APPLE_INFO_CACHE = None
+
+
+def _apple_gpu_info():
+    """Static Apple-Silicon accelerator info — the Metal counterpart of the
+    nvidia-smi query. Uses `system_profiler SPDisplaysDataType` for the chip/GPU
+    name (+ core count when present) and `sysctl hw.memsize` for the unified
+    memory total. Cached (hardware is fixed for the session)."""
+    global _APPLE_INFO_CACHE
+    if _APPLE_INFO_CACHE is not None:
+        return _APPLE_INFO_CACHE
+    name, cores = "Apple GPU", None
+    try:
+        out = subprocess.check_output(
+            ["system_profiler", "-json", "SPDisplaysDataType"],
+            timeout=10, stderr=subprocess.DEVNULL,
+        ).decode()
+        disp = json.loads(out).get("SPDisplaysDataType", [])
+        if disp:
+            d0 = disp[0]
+            name = d0.get("sppci_model") or d0.get("_name") or name
+            raw_cores = d0.get("sppci_cores") or d0.get("spdisplays_ndrvs")
+            if raw_cores:
+                try:
+                    cores = int(str(raw_cores).split()[0])
+                except (ValueError, IndexError):
+                    pass
+    except Exception:
+        pass
+    mem_total_mb = 0
+    try:
+        mem_total_mb = int(subprocess.check_output(
+            ["sysctl", "-n", "hw.memsize"], timeout=5,
+        ).decode().strip()) // (1024 * 1024)
+    except Exception:
+        pass
+    _APPLE_INFO_CACHE = {"name": name, "cores": cores, "mem_total_mb": mem_total_mb}
+    return _APPLE_INFO_CACHE
+
+
+def _apple_gpu_mem_used_mb():
+    """Live unified-memory used (MB) via `vm_stat` — the closest analog to CUDA
+    memory.used on Apple's unified-memory GPU (active + wired + compressed)."""
+    try:
+        out = subprocess.check_output(["vm_stat"], timeout=5).decode()
+        m = re.search(r"page size of (\d+) bytes", out)
+        pgsize = int(m.group(1)) if m else 16384
+
+        def _pages(label):
+            mm = re.search(rf"{label}:\s+(\d+)\.", out)
+            return int(mm.group(1)) if mm else 0
+        used = (_pages("Pages active") + _pages("Pages wired down")
+                + _pages("Pages occupied by compressor"))
+        return used * pgsize // (1024 * 1024)
+    except Exception:
+        return 0
+
+
+def _cuda_env_prefix(gpu):
+    """`CUDA_VISIBLE_DEVICES=<gpu> ` prefix for a launch command — empty on
+    non-CUDA platforms. Apple (MPS/MLX) uses its single device implicitly and
+    CPU has none, so pinning CUDA_VISIBLE_DEVICES there is meaningless."""
+    if gpu is None or _detect_platform() != "cuda":
+        return ""
+    return f"CUDA_VISIBLE_DEVICES={gpu} "
 
 
 def _get_gpu_count(force_refresh=False):
@@ -4027,7 +4114,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             f"     --engine {engine}"
         )
 
-        gpu_env = f"CUDA_VISIBLE_DEVICES={gpu} "
+        gpu_env = _cuda_env_prefix(gpu)
         # Cap CPU thread pools (same rationale as gradio launches: nproc-sized
         # default pools can exhaust ulimit -u when multiple training procs are
         # alive). Tied to GRADIO_THREAD_CAP for consistency.
@@ -4389,7 +4476,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         # Launch — use GPU from request body if provided, else fall back to run's previous GPU
         gpu = body.get("gpu", run.get("gpu"))
-        gpu_env = f"CUDA_VISIBLE_DEVICES={gpu} " if gpu is not None else ""
+        gpu_env = _cuda_env_prefix(gpu)
         # Refuse the resume up front if the run's declared backends aren't
         # installed (see _missing_backend_error_for_model docstring).
         backend_err = _missing_backend_error_for_model(run.get("base_model"))
@@ -5017,31 +5104,46 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         """Query nvidia-smi and annotate GPUs with training/gradio labels.
         Generous timeout because the first nvidia-smi call on a fresh Colab
         VM can take 5–10 s while the driver initializes."""
+        plat = _detect_platform()
         gpus = []
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=index,memory.used,memory.total,memory.free,utilization.gpu",
-                 "--format=csv,noheader,nounits"],
-                timeout=15, stderr=subprocess.DEVNULL,
-            ).decode().strip()
-            for line in out.split("\n"):
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) < 5:
-                    continue
-                gpus.append({
-                    "gpu": int(parts[0]),
-                    "used_mb": int(parts[1]),
-                    "total_mb": int(parts[2]),
-                    "free_mb": int(parts[3]),
-                    "util_pct": int(parts[4]),
-                    "labels": [],
-                })
-        except Exception:
-            return {"gpus": [], "gradio_estimate": _gradio_vram}
-
-        caps = _query_gpu_compute_caps()
-        for g in gpus:
-            g["compute_cap"] = caps.get(g["gpu"])
+        if plat == "apple":
+            # Single unified-memory Metal device — usable via MPS (torch) or MLX.
+            info = _apple_gpu_info()
+            used = _apple_gpu_mem_used_mb()
+            total = info["mem_total_mb"]
+            gpus = [{
+                "gpu": 0, "kind": "apple",
+                "name": info["name"], "cores": info.get("cores"),
+                "used_mb": used, "total_mb": total,
+                "free_mb": max(0, total - used), "util_pct": 0,
+                "labels": [], "compute_cap": None,
+            }]
+        elif plat == "cuda":
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=index,memory.used,memory.total,memory.free,utilization.gpu",
+                     "--format=csv,noheader,nounits"],
+                    timeout=15, stderr=subprocess.DEVNULL,
+                ).decode().strip()
+                for line in out.split("\n"):
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 5:
+                        continue
+                    gpus.append({
+                        "gpu": int(parts[0]),
+                        "used_mb": int(parts[1]),
+                        "total_mb": int(parts[2]),
+                        "free_mb": int(parts[3]),
+                        "util_pct": int(parts[4]),
+                        "labels": [],
+                    })
+            except Exception:
+                return {"gpus": [], "platform": "cuda", "engines": ["torch"],
+                        "gradio_estimate": _gradio_vram}
+            caps = _query_gpu_compute_caps()
+            for g in gpus:
+                g["compute_cap"] = caps.get(g["gpu"])
+        # plat == "cpu": no accelerator device; gpus stays [].
 
         # Build lookup: gpu -> used_mb for checking occupancy
         gpu_mem = {g["gpu"]: g["used_mb"] for g in gpus}
@@ -5131,7 +5233,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         else:
             visible_gpus = None  # not set = all visible
 
-        resp = {"gpus": gpus, "gradio_estimate": _gradio_vram, "arc_info": arc_info}
+        resp = {"gpus": gpus, "gradio_estimate": _gradio_vram, "arc_info": arc_info,
+                "platform": plat,
+                "engines": ["torch", "mlx"] if plat == "apple" else ["torch"]}
         if visible_gpus is not None:
             resp["cuda_visible_devices"] = visible_gpus
         return resp

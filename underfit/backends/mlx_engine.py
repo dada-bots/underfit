@@ -35,12 +35,6 @@ _SA3_LOCAL = str(_HERE.parent.parent.parent.parent / "stable-audio-3")
 
 _SUPPORTED_DITS = ("sm-music", "sm-sfx", "medium")
 
-# Underfit's tqdm-postfix step line the MLX trainer emits, per its locked
-# contract:  "step {N}  train/loss {L:.6f}  train/lr {lr:.3e}  epoch {E}  (…)"
-_STEP_LINE_RE = re.compile(
-    r"^step (\d+)\s+train/loss (\S+)\s+train/lr (\S+)\s+epoch (\d+)"
-)
-
 _STEP_TOKEN_RE = re.compile(r"step=(\d+)")
 _EPOCH_TOKEN_RE = re.compile(r"epoch=(\d+)")
 
@@ -285,19 +279,29 @@ def _resolve_offsets(training, resume_path):
 
 def _build_demo_entries(demo):
     """Map underfit's `training.demo` block onto the MLX trainer's --demo-config,
-    which is a flat LIST of entries {prompt, cfg, seed, steps, lora_strength?,
-    lora_interval_max?}. ARC entries are skipped: the MLX trainer finetunes the
-    BASE model, and ARC demos need a weight-swap/second-model it doesn't do."""
+    which is a flat LIST of entries {prompt, cfg, seed, steps, arc?,
+    lora_strength?, lora_interval_max?}.
+
+    Both RF/base and ARC entries are passed through. ARC entries carry
+    ``arc: true`` and default to cfg=1 / steps=8 (the distilled rf_denoiser
+    convention, matching underfit's demo_step._run_one_arc_entry); the MLX
+    trainer renders them by loading the shipped ARC weights with the trained
+    LoRA merged in and sampling with the pingpong integrator. RF entries default
+    to the run's demo_cfg_scales[0] / demo_steps."""
     cfg_scales = demo.get("demo_cfg_scales") or [7]
     default_cfg = cfg_scales[0] if cfg_scales else 7
     default_steps = demo.get("demo_steps", 50)
     entries = []
     for e in demo.get("demo_cond") or []:
         if e.get("arc"):
-            continue
-        entry = {"prompt": e.get("prompt", ""),
-                 "cfg": e.get("cfg", default_cfg),
-                 "steps": e.get("steps", default_steps)}
+            entry = {"prompt": e.get("prompt", ""),
+                     "cfg": e.get("cfg", 1),        # ARC: distilled, cfg=1
+                     "steps": e.get("steps", 8),    # ARC: 8-step pingpong
+                     "arc": True}
+        else:
+            entry = {"prompt": e.get("prompt", ""),
+                     "cfg": e.get("cfg", default_cfg),
+                     "steps": e.get("steps", default_steps)}
         for k in ("seed", "lora_strength", "lora_interval_max"):
             if e.get(k) is not None:
                 entry[k] = e[k]
@@ -375,6 +379,13 @@ def build_trainer_cmd(args, base_weights=None):
         _add(cmd, "--beta2", betas[1])
     _add(cmd, "--eps", opt_cfg.get("eps"))
     _add(cmd, "--weight-decay", opt_cfg.get("weight_decay"))
+
+    # gradient clipping: the dashboard passes --gradient-clip-val (1.0 by
+    # default, server.py restart_cmd) to lora_train.py; forward it so the MLX
+    # trainer clips identically and the grad_norm metric is post-clip like torch.
+    gcv = getattr(args, "gradient_clip_val", None)
+    if gcv:
+        _add(cmd, "--gradient-clip-val", gcv)
 
     # LR scheduler: only InverseLR is supported (the SA3 templates' scheduler)
     sched = _scheduler_config(training)
@@ -460,13 +471,18 @@ def build_encode_cmd(input_dir, output_dir, base_model, exclude_file=None):
 # Runners
 # --------------------------------------------------------------------------- #
 def run_mlx_training(args):
-    """Launch the MLX trainer, stream its stdout, and return its exit code.
+    """Launch the MLX trainer, inheriting its stdout/stderr, and return its exit
+    code.
 
     cwd is the current process cwd (the dashboard already cd's into the run's
     demo dir before invoking lora_train.py), so loss_by_timestep.bin and demo
-    files land where the dashboard expects. Every trainer step line is echoed
-    verbatim and ALSO re-emitted in the dashboard's tqdm-progress format so the
-    step/loss/lr parsers pick it up.
+    files land where the dashboard expects. The trainer emits the SAME tqdm
+    output as underfit's torch loop (desc "Step N, Epoch E"; postfix
+    train/loss, train/lr, train/grad_norm, train/lora_magnitude), so we let it
+    write straight through to lora_train.py's stdout (which the dashboard has
+    redirected to the run log). No line interception/translation — that would
+    break tqdm's \\r in-place updates (the dashboard collapses on them) and drop
+    the grad_norm / lora_magnitude postfix the charts parse.
     """
     model_config = _load_json(args.model_config)
     dit = _dit_model_from_config(model_config)
@@ -490,33 +506,10 @@ def run_mlx_training(args):
 
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
-    proc = subprocess.Popen(
-        cmd,
-        cwd=os.getcwd(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
-    try:
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            print(line, flush=True)
-            m = _STEP_LINE_RE.match(line)
-            if m:
-                n, loss, lr, ep = m.group(1), m.group(2), m.group(3), m.group(4)
-                # Format satisfies dashboard/server.py:
-                #   _parse_latest_step  (Epoch N: … a/b  + "Step N," prefix)
-                #   _HISTORY_RE / _LR_RE (train/loss= and train/lr=)
-                print(
-                    f"Step {n}, Epoch {ep}: 100%|##########| 1/1 "
-                    f"train/loss={loss} train/lr={lr}",
-                    flush=True,
-                )
-    finally:
-        if proc.stdout:
-            proc.stdout.close()
+    # Inherit stdout/stderr: the trainer's tqdm writes straight to the run log
+    # (via lora_train.py's redirected fd), preserving \r so the dashboard
+    # collapses the progress bar and parses every step's postfix metrics.
+    proc = subprocess.Popen(cmd, cwd=os.getcwd(), env=env)
     code = proc.wait()
     print(f"[mlx-engine] MLX trainer exited with code {code}", flush=True)
     return code

@@ -1280,6 +1280,8 @@
           <select class="modal-select" id="new-ft-base-model" onchange="_warnUnregisteredModel(this.value);_applyDefaultExclusions();filterNewFtDatasets();renderModuleChips();validateNewFt();updateCkptEstimate();_newFtDemos=_defaultNewFtDemos();_updateCropLength()">
             <!-- Options populated dynamically from /api/models (dashboard/models/*/registry.json). -->
           </select>
+          <!-- On-demand MLX pack download (Apple + engine=mlx, item 5) -->
+          <div id="new-ft-download" style="display:none;margin-top:6px"></div>
         </div>
         <div>
           <label class="modal-label">Engine</label>
@@ -5581,6 +5583,77 @@ window._warnUnregisteredModel = function(modelKey) {
   _showSeedDialog('Base model not downloaded', bodyHtml, [{label: 'OK', primary: true}]);
 };
 
+// ── On-demand MLX model-pack download (item 5) ──────────────────────
+// When a base model's MLX weights (base + ARC + codec + encoder + t5) aren't
+// present, offer to download them into the MLX checkout instead of a dead-end
+// "run installer" message. Renders into `containerId`; `onDone()` re-runs once
+// the pack lands so the gate clears. Apple + engine=mlx only.
+const _mlxDlState = {};   // modelKey -> 'idle'|'downloading'|'done'|'error'
+const _mlxDlCb = {};      // modelKey -> onDone callback
+
+window._renderMlxDownload = function(containerId, modelKey, meta, show, onDone) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (!show) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'block';
+  _mlxDlCb[modelKey] = onDone;
+  if (_mlxDlState[modelKey] === 'downloading') return;  // poller owns the panel
+  const label = _escAttr(meta.label || modelKey);
+  const gb = meta.mlx_download_gb ? ` (~${meta.mlx_download_gb} GB)` : '';
+  el.innerHTML =
+    `<div style="color:var(--yellow);font-size:0.9em;display:flex;align-items:center;gap:8px;flex-wrap:wrap">`
+    + `<span>⚠ ${label} not downloaded for MLX${gb}</span>`
+    + `<button class="modal-select" style="width:auto;padding:2px 10px;cursor:pointer" `
+    + `onclick="_startModelDownload('${_escAttr(modelKey)}','${containerId}')">Download base + ARC</button>`
+    + `</div>`;
+};
+
+window._startModelDownload = async function(modelKey, containerId) {
+  _mlxDlState[modelKey] = 'downloading';
+  const el = document.getElementById(containerId);
+  if (el) el.innerHTML = `<div class="mlx-dl-prog" style="color:var(--yellow);font-size:0.9em">Starting download…</div>`;
+  try {
+    const res = await fetch('/api/models/download', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model: modelKey}),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'failed to start');
+  } catch (e) {
+    _mlxDlState[modelKey] = 'error';
+    if (el) el.innerHTML = `<div style="color:var(--red);font-size:0.9em">Download failed: ${_escAttr(e.message)}</div>`;
+    return;
+  }
+  _pollModelDownload(modelKey, containerId);
+};
+
+window._pollModelDownload = async function(modelKey, containerId) {
+  const el = document.getElementById(containerId);
+  let data;
+  try {
+    const res = await fetch('/api/models/download?model=' + encodeURIComponent(modelKey));
+    data = await res.json();
+  } catch (e) { setTimeout(() => _pollModelDownload(modelKey, containerId), 2500); return; }
+  if (data.state === 'downloading') {
+    const cur = data.current_file ? ` — ${_escAttr(data.current_file)}` : '';
+    const rem = data.remaining_gb ? `, ${data.remaining_gb} GB left` : '';
+    if (el) el.innerHTML = `<div class="mlx-dl-prog" style="color:var(--yellow);font-size:0.9em">`
+      + `Downloading ${data.done_files || 0}/${data.total_files || '?'} files${rem}${cur}…</div>`;
+    setTimeout(() => _pollModelDownload(modelKey, containerId), 2500);
+    return;
+  }
+  if (data.state === 'done' || data.available) {
+    _mlxDlState[modelKey] = 'done';
+    if (el) { el.style.display = 'none'; el.innerHTML = ''; }
+    await _loadRemoteModels();                       // refresh mlx_available
+    const cb = _mlxDlCb[modelKey];
+    if (typeof cb === 'function') cb();              // re-validate → gate clears
+    return;
+  }
+  _mlxDlState[modelKey] = 'error';
+  if (el) el.innerHTML = `<div style="color:var(--red);font-size:0.9em">Download failed — see server log</div>`;
+};
+
 // Open the file picker for the seed-LoRA upload. Always clear the input's
 // value first — otherwise re-picking the same file (after Cancel) doesn't
 // re-fire the change event and the picker appears to do nothing.
@@ -6210,10 +6283,17 @@ window.validateNewFt = function() {
   // its own base npz (auto-downloaded / local in the MLX checkout), so the torch
   // download isn't required for an mlx run.
   const _ftEngine = (document.getElementById('new-ft-engine') || {}).value || 'torch';
+  // MLX engine: gate on the MLX pack (base+ARC+codec+encoder+t5), not the torch
+  // 'registered' flag. If missing, the download panel offers an on-demand fetch;
+  // Next stays disabled until it lands (item 5).
+  const _mlxUnavail = _platform === 'apple' && _ftEngine === 'mlx'
+    && baseModelMeta.mlx_available === false;
+  _renderMlxDownload('new-ft-download', baseModelKey, baseModelMeta, _mlxUnavail, validateNewFt);
   let error = '';
   if (_newFtNoDatasets) error = 'Create a dataset first';
   else if (baseModelKey && baseModelMeta.registered === false && _ftEngine !== 'mlx')
     error = `Base model "${baseModelMeta.label || baseModelKey}" not downloaded — please run installer again`;
+  else if (_mlxUnavail) error = '_mlx_download';
   else if (!name) error = '_name_empty';
   else if (runsData.some(r => r.display_name === name)) error = `Run "${name}" already exists`;
   else if (isNaN(steps) || steps < 100) error = 'Steps must be >= 100';
@@ -6230,13 +6310,14 @@ window.validateNewFt = function() {
   // Show name errors next to the label; other errors in the estimate area
   const nameLabelEl = document.getElementById('new-ft-name').parentElement.querySelector('.modal-label');
   const isNameError = error === '_name_empty' || error.startsWith('Run "');
+  const isMlxDl = error === '_mlx_download';  // shown via the download panel
   if (nameLabelEl) {
     if (error === '_name_empty') nameLabelEl.innerHTML = 'Run name <span style="color:var(--red)">*</span>';
     else if (error.startsWith('Run "')) nameLabelEl.innerHTML = `Run name <span style="color:var(--red);font-weight:400;font-size:0.85em">${error}</span>`;
     else nameLabelEl.innerHTML = 'Run name';
   }
   btn.disabled = !!error;
-  if (error && !isNameError) { el.style.color = 'var(--red)'; el.textContent = error; }
+  if (error && !isNameError && !isMlxDl) { el.style.color = 'var(--red)'; el.textContent = error; }
   else { el.style.color = 'var(--yellow)'; updateCkptEstimate(); }
   updateLayerPreview();
 };

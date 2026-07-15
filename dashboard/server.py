@@ -2564,6 +2564,14 @@ _gradio_vram_lock = threading.Lock()
 _gradio_vram = {"load_mb": 10000, "peak_mb": 12000, "n_samples": 0}
 _gradio_vram_baselines = {}  # instance_id -> {"gpu": int, "before_mb": int, "measured": bool}
 
+# MLX model-pack downloads (Apple on-demand, item 5). dit -> {proc, log, started}.
+# Each is a subprocess running mlx_engine.build_mlx_download_cmd (weights.
+# ensure_local for the base+arc+codec+t5 pack) with stdout tee'd to a log the
+# status endpoint tails for progress.
+_mlx_downloads = {}
+_mlx_downloads_lock = threading.Lock()
+_MLX_DOWNLOAD_DIR = STATE_FILES_DIR / "mlx_downloads"
+
 
 def _load_gradio_vram_estimate():
     global _gradio_vram
@@ -3268,7 +3276,32 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
         elif path == "/api/models":
-            self._json_response({"models": MODELS_UI_PAYLOAD})
+            payload = MODELS_UI_PAYLOAD
+            # On Apple, annotate each model with whether its MLX weight pack
+            # (base + arc + codec + encoder + t5) is present, so the UI can
+            # offer an on-demand download instead of the torch 'registered' flag.
+            if _detect_platform() == "apple":
+                try:
+                    from underfit.backends import mlx_engine
+                    payload = {}
+                    for k, v in MODELS_UI_PAYLOAD.items():
+                        vv = dict(v)
+                        try:
+                            vv["mlx_available"] = mlx_engine.mlx_model_available(k)
+                            _miss, _gb = mlx_engine.mlx_missing_pack(
+                                mlx_engine.map_model_name(k))
+                            vv["mlx_download_gb"] = _gb
+                        except Exception:
+                            vv["mlx_available"] = None
+                        payload[k] = vv
+                except Exception:
+                    payload = MODELS_UI_PAYLOAD
+            self._json_response({"models": payload})
+        elif path == "/api/models/download":
+            # Status of an on-demand MLX pack download. ?model=<key>
+            qs = parse_qs(parsed.query)
+            model = (qs.get("model") or [None])[0]
+            self._json_response(self._mlx_download_status(model))
         elif path == "/api/runs":
             self._json_response(self._get_runs())
         elif path == "/api/status":
@@ -3598,6 +3631,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json_response({"error": err}, status=409)
             else:
                 self._json_response({"id": instance_id}, status=201)
+        elif parsed.path == "/api/models/download":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._start_mlx_download(body.get("model"))
         elif parsed.path == "/api/runs/new":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
@@ -5250,6 +5287,88 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if visible_gpus is not None:
             resp["cuda_visible_devices"] = visible_gpus
         return resp
+
+    def _start_mlx_download(self, model):
+        """Kick off (or report) an on-demand MLX pack download for `model`.
+        Apple-only; the pack (base + arc + codec + encoder + t5) is fetched into
+        the existing MLX checkout via the MLX venv's weights.ensure_local."""
+        if _detect_platform() != "apple":
+            self._json_response(
+                {"error": "MLX model download is Apple-only."}, status=400)
+            return
+        try:
+            from underfit.backends import mlx_engine
+            dit = mlx_engine.map_model_name(model)
+        except Exception as e:
+            self._json_response({"error": str(e)}, status=400)
+            return
+        if mlx_engine.mlx_model_available(model):
+            self._json_response({"ok": True, "state": "available"})
+            return
+        with _mlx_downloads_lock:
+            cur = _mlx_downloads.get(dit)
+            if cur and cur["proc"].poll() is None:
+                self._json_response({"ok": True, "state": "downloading", "dit": dit})
+                return
+            try:
+                cmd = mlx_engine.build_mlx_download_cmd(dit)
+                mlx_root, _ = mlx_engine.resolve_mlx_paths()
+            except FileNotFoundError as e:
+                self._json_response({"error": str(e)}, status=400)
+                return
+            _MLX_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = _MLX_DOWNLOAD_DIR / f"{dit}.log"
+            try:
+                logf = open(log_path, "w")
+            except OSError as e:
+                self._json_response({"error": str(e)}, status=500)
+                return
+            env = dict(os.environ)
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            proc = subprocess.Popen(
+                cmd, cwd=mlx_root, stdout=logf, stderr=subprocess.STDOUT, env=env)
+            _mlx_downloads[dit] = {
+                "proc": proc, "log": str(log_path), "started": time.time()}
+        self._json_response(
+            {"ok": True, "state": "downloading", "dit": dit}, status=201)
+
+    def _mlx_download_status(self, model):
+        """Progress of an on-demand MLX pack download for `model`."""
+        try:
+            from underfit.backends import mlx_engine
+            dit = mlx_engine.map_model_name(model)
+        except Exception as e:
+            return {"state": "error", "error": str(e), "available": False}
+        available = mlx_engine.mlx_model_available(model)
+        total = len(mlx_engine.mlx_pack_rel_paths(dit))
+        with _mlx_downloads_lock:
+            cur = _mlx_downloads.get(dit)
+        state = "available" if available else "idle"
+        done_files, current = 0, None
+        if cur:
+            rc = cur["proc"].poll()
+            try:
+                log = Path(cur["log"]).read_text()
+            except Exception:
+                log = ""
+            oks = set(re.findall(r"OK (\S+)", log))
+            dls = re.findall(r"DL (\S+)", log)
+            done_files = len(oks)
+            pending = [d for d in dls if d not in oks]
+            current = os.path.basename(pending[-1]) if pending else None
+            if rc is None:
+                state = "downloading"
+            elif "ALL_DONE" in log or available:
+                state = "done"
+            else:
+                state = "error"
+        return {
+            "state": state, "available": available,
+            "done_files": done_files, "total_files": total,
+            "current_file": current,
+            "remaining_gb": (mlx_engine.mlx_missing_pack(dit)[1]
+                             if not available else 0),
+        }
 
     def _descendant_pids(self, pid):
         """Set of all descendant PIDs of pid (recursive pgrep -P)."""

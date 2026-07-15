@@ -94,6 +94,88 @@ def map_model_name(base_model):
     return name
 
 
+# --------------------------------------------------------------------------- #
+# MLX model packs (weights) — availability + download
+# --------------------------------------------------------------------------- #
+# A model's MLX "pack": base npz (LoRA training) + arc npz (inference / ARC
+# demos) + SAME decoder + SAME encoder (a2a / dataset encode) + the shared
+# t5gemma conditioner. Mirrors scripts/weights.py (DIT_BUNDLES + SHARED +
+# TRAINING_BASE) in the MLX checkout — that file stays the download source of
+# truth (ensure_local); this list drives availability + size for the
+# dashboard/installer WITHOUT importing the MLX venv. Sizes (GB) approximate.
+_MLX_FILE_GB = {
+    "dit_medium-base_f16.npz": 2.70, "dit_medium_f16.npz": 2.70,
+    "same_l_decoder_f32.npz": 1.58, "same_l_encoder_f32.npz": 1.58,
+    "dit_sm-music-base_f16.npz": 0.85, "dit_sm-music_f16.npz": 0.85,
+    "dit_sm-sfx-base_f16.npz": 0.85, "dit_sm-sfx_f16.npz": 0.85,
+    "same_s_decoder_f32.npz": 0.20, "same_s_encoder_f32.npz": 0.20,
+    "t5gemma_f16.npz": 0.52,
+}
+
+
+def mlx_pack_rel_paths(dit):
+    """The models/mlx/*.npz a --dit model needs (base + arc + codec + t5)."""
+    codec = "same_l" if dit == "medium" else "same_s"
+    return [
+        f"models/mlx/dit_{dit}-base_f16.npz",     # base — LoRA training
+        f"models/mlx/dit_{dit}_f16.npz",          # arc  — inference / ARC demos
+        f"models/mlx/{codec}_decoder_f32.npz",    # decode
+        f"models/mlx/{codec}_encoder_f32.npz",    # encode (a2a / dataset)
+        "models/mlx/t5gemma_f16.npz",             # shared conditioner
+    ]
+
+
+def mlx_root_or_none():
+    """MLX checkout root if it resolves on disk, else None (no raise) — for
+    availability checks before the checkout/venv are known to exist."""
+    root = os.environ.get("UNDERFIT_MLX_ROOT") or os.path.join(
+        _SA3_LOCAL, "optimized", "mlx")
+    root = os.path.abspath(root)
+    return root if os.path.isdir(root) else None
+
+
+def mlx_missing_pack(dit):
+    """(missing_rel_paths, approx_gb) for a --dit model's MLX pack. Everything
+    counts as missing if the checkout itself isn't present yet."""
+    root = mlx_root_or_none()
+    paths = mlx_pack_rel_paths(dit)
+    missing = [p for p in paths
+               if not (root and os.path.isfile(os.path.join(root, p)))]
+    gb = round(sum(_MLX_FILE_GB.get(os.path.basename(p), 0.0) for p in missing), 1)
+    return missing, gb
+
+
+def mlx_model_available(base_model):
+    """True if the model's MLX pack is fully present on disk (base + arc + codec
+    + encoder + t5). base_model may be 'sa3-medium' or 'medium'."""
+    try:
+        dit = map_model_name(base_model)
+    except ValueError:
+        return False
+    missing, _ = mlx_missing_pack(dit)
+    return not missing
+
+
+def build_mlx_download_cmd(dit):
+    """MLX-venv-python command that downloads a model's whole pack via the MLX
+    checkout's weights.ensure_local (the download source of truth). Emits
+    'DL <path>' / 'OK <path>' per file and 'ALL_DONE' at the end so callers can
+    show progress. Run with cwd=<mlx_root>."""
+    _, mlx_python = resolve_mlx_paths()
+    paths = mlx_pack_rel_paths(dit)
+    prog = (
+        "import sys; sys.path.insert(0, 'scripts')\n"
+        "from weights import ensure_local\n"
+        f"paths = {paths!r}\n"
+        "for p in paths:\n"
+        "    print('DL ' + p, flush=True)\n"
+        "    ensure_local(p, verbose=False)\n"
+        "    print('OK ' + p, flush=True)\n"
+        "print('ALL_DONE', flush=True)\n"
+    )
+    return [mlx_python, "-c", prog]
+
+
 def resolve_base_weights(dit_model):
     """Path to the MLX BASE-checkpoint DiT weights npz for a --dit value.
 

@@ -6293,10 +6293,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             # so point it AT latent_dir rather than output_dir.)
             from underfit.backends import mlx_engine
             latent_dir.mkdir(parents=True, exist_ok=True)
-            encode_args = mlx_engine.build_encode_cmd(input_path, latent_dir, model)
-            if exclude_set:
-                print(f"[encode] mlx encoder does not yet honor the exclude list "
-                      f"({len(exclude_set)} file(s)) — encoding the full folder.")
+            encode_args = mlx_engine.build_encode_cmd(
+                input_path, latent_dir, model, exclude_file=exclude_file)
             encode_env = os.environ.copy()
             encode_env.update({"PYTHONUNBUFFERED": "1"})
         else:

@@ -238,6 +238,25 @@ def _dist_shift_from_config(model_config):
     return opts.get("type")
 
 
+def _use_effective_length(model_config):
+    """model.diffusion.use_effective_length_for_schedule (True in SA3 templates):
+    shift timesteps by ceil(int(seconds_total*sr)/4096) not the crop length."""
+    diffusion = (model_config.get("model", {}) or {}).get("diffusion", {}) or {}
+    return bool(diffusion.get("use_effective_length_for_schedule", False))
+
+
+def _optimizer_config(training):
+    """training.optimizer_configs.diffusion.optimizer.config (AdamW betas/eps/wd)."""
+    opt = training.get("optimizer_configs") or {}
+    return ((opt.get("diffusion", {}) or {}).get("optimizer", {}) or {}).get("config", {}) or {}
+
+
+def _scheduler_config(training):
+    """training.optimizer_configs.diffusion.scheduler (type + config), or None."""
+    opt = training.get("optimizer_configs") or {}
+    return (opt.get("diffusion", {}) or {}).get("scheduler")
+
+
 def _parse_filename_offsets(path):
     """(step, epoch) parsed from a checkpoint filename; either may be None.
     Mirrors underfit.training.loop._parse_filename_offsets."""
@@ -330,7 +349,10 @@ def build_trainer_cmd(args, base_weights):
     _add(cmd, "--max-steps", getattr(args, "max_steps", None))
     _add(cmd, "--checkpoint-every", getattr(args, "checkpoint_every", None))
 
-    _add(cmd, "--adapter-type", lora_cfg.get("adapter_type"))
+    # adapter_type: underfit's config-layer default is "lora" when absent
+    # (lora_config.get("adapter_type", "lora")); the MLX trainer defaults to
+    # dora-rows, so pass "lora" explicitly to match a template without one.
+    _add(cmd, "--adapter-type", lora_cfg.get("adapter_type", "lora"))
     _add(cmd, "--rank", lora_cfg.get("rank"))
     _add(cmd, "--alpha", lora_cfg.get("alpha"))
     _add(cmd, "--include", _csv(lora_cfg.get("include")))
@@ -339,7 +361,28 @@ def build_trainer_cmd(args, base_weights):
     _add(cmd, "--latent-crop-length", dataset_config.get("latent_crop_length"))
     _add(cmd, "--timestep-sampler", training.get("timestep_sampler"))
     _add(cmd, "--dist-shift", _dist_shift_from_config(model_config))
+    if _use_effective_length(model_config):
+        cmd.append("--use-effective-length")
     _add(cmd, "--cfg-dropout-prob", training.get("cfg_dropout_prob"))
+
+    # optimizer: AdamW betas/eps/weight_decay (torch decoupled-wd == MLX AdamW)
+    opt_cfg = _optimizer_config(training)
+    betas = opt_cfg.get("betas")
+    if isinstance(betas, (list, tuple)) and len(betas) == 2:
+        _add(cmd, "--beta1", betas[0])
+        _add(cmd, "--beta2", betas[1])
+    _add(cmd, "--eps", opt_cfg.get("eps"))
+    _add(cmd, "--weight-decay", opt_cfg.get("weight_decay"))
+
+    # LR scheduler: only InverseLR is supported (the SA3 templates' scheduler)
+    sched = _scheduler_config(training)
+    if isinstance(sched, dict) and sched.get("type") == "InverseLR":
+        sc = sched.get("config", {}) or {}
+        cmd.extend(["--lr-scheduler", "inverse"])
+        _add(cmd, "--inv-gamma", sc.get("inv_gamma"))
+        _add(cmd, "--lr-power", sc.get("power"))
+        _add(cmd, "--lr-warmup", sc.get("warmup"))
+        _add(cmd, "--lr-final", sc.get("final_lr"))
 
     # --- Resume: CLI arg wins over training_config.lora_ckpt_path (matches
     # underfit.training.loop) ---

@@ -100,6 +100,14 @@ def get_all_args(defaults_file="defaults.ini"):
     p.add_argument("--wandb-config", default=None)
     p.add_argument("--backend", default=None,
                   help="sat | sa3 (default: env UNDERFIT_BACKEND or auto)")
+    # Pre-register --engine so the generic defaults loop below (which would add
+    # it from defaults.ini) is swallowed by its ArgumentError guard — this
+    # explicit registration keeps default=None so we can apply the
+    # CLI > env > defaults.ini > torch precedence after parsing.
+    p.add_argument("--engine", default=None, choices=["torch", "mlx"],
+                  help="torch | mlx (default: env UNDERFIT_ENGINE, defaults.ini, "
+                       "else torch). mlx runs the Apple-Silicon MLX trainer in "
+                       "the sibling stable-audio-3 checkout.")
     for key, value in defaults.items():
         arg_name = f"--{key.replace('_', '-')}"
         try:
@@ -124,6 +132,13 @@ def get_all_args(defaults_file="defaults.ini"):
                     setattr(args, key, float(val))
                 except ValueError:
                     pass
+    # Engine selection precedence: CLI --engine > env UNDERFIT_ENGINE >
+    # defaults.ini > torch.
+    if getattr(args, "engine", None) is None:
+        args.engine = os.environ.get("UNDERFIT_ENGINE") or defaults.get("engine") or "torch"
+    args.engine = str(args.engine).strip().strip("'\"").lower()
+    if args.engine not in ("torch", "mlx"):
+        raise SystemExit(f"--engine must be 'torch' or 'mlx', got {args.engine!r}")
     return args
 
 
@@ -131,6 +146,13 @@ def main():
     args = get_all_args()
     if os.environ.get("SLURM_PROCID") is not None:
         args.seed = (args.seed or 0) + int(os.environ["SLURM_PROCID"])
+
+    # --- MLX engine: delegate to the sibling stable-audio-3 MLX trainer. ---
+    # Purely additive; the torch path below is unchanged for engine=torch.
+    if getattr(args, "engine", "torch") == "mlx":
+        from underfit.backends import mlx_engine
+        sys.exit(mlx_engine.run_mlx_training(args))
+
     # Pre-warn (and quiet torch's noisy autotune warnings) on pre-Ampere GPUs.
     from underfit.utils import check_attention_compute_capability, check_attention_backends
     check_attention_compute_capability()

@@ -1270,7 +1270,7 @@
     <div id="new-ft-step1">
       <h3>New Finetune</h3>
       <div style="color:var(--text2);font-size:0.8em;margin-bottom:12px">Launch a new LoRA training run from scratch</div>
-      <div style="display:grid;grid-template-columns:1fr auto auto;gap:12px;margin-bottom:4px">
+      <div style="display:grid;grid-template-columns:1fr auto auto auto;gap:12px;margin-bottom:4px">
         <div>
           <label class="modal-label">Run name</label>
           <input type="text" class="resume-input" id="new-ft-name" value="" placeholder="" oninput="validateNewFt()" onblur="if(this.value.trim())this.value=_slugify(this.value)">
@@ -1279,6 +1279,13 @@
           <label class="modal-label">Base model</label>
           <select class="modal-select" id="new-ft-base-model" onchange="_warnUnregisteredModel(this.value);_applyDefaultExclusions();filterNewFtDatasets();renderModuleChips();validateNewFt();updateCkptEstimate();_newFtDemos=_defaultNewFtDemos();_updateCropLength()">
             <!-- Options populated dynamically from /api/models (dashboard/models/*/registry.json). -->
+          </select>
+        </div>
+        <div>
+          <label class="modal-label">Engine</label>
+          <select class="modal-select" id="new-ft-engine" title="torch: in-process PyTorch loop (MPS/CUDA/CPU). mlx: Apple-Silicon MLX trainer in the sibling stable-audio-3 checkout.">
+            <option value="torch" selected>torch</option>
+            <option value="mlx">mlx</option>
           </select>
         </div>
         <div>
@@ -6172,6 +6179,7 @@ window.confirmNewFinetune = async function() {
   const steps = parseInt(document.getElementById('new-ft-steps').value, 10);
   const batch = parseInt(document.getElementById('new-ft-batch').value, 10);
   const base_model = document.getElementById('new-ft-base-model').value;
+  const engine = (document.getElementById('new-ft-engine') || {}).value || 'torch';
   const lora_type = document.getElementById('new-ft-lora-type').value;
   const rank = parseInt(document.getElementById('new-ft-rank').value, 10);
   const alphaStr = document.getElementById('new-ft-alpha').value.trim();
@@ -6182,7 +6190,7 @@ window.confirmNewFinetune = async function() {
   if (!name || _newFtSelectedGpu === null || isNaN(steps) || isNaN(batch)) return;
   closeNewFinetuneModal();
   const payload = {name, gpu: _newFtSelectedGpu, max_steps: steps, batch_size: batch,
-    base_model, lora_type, rank, checkpoint_every, demo_every};
+    base_model, engine, lora_type, rank, checkpoint_every, demo_every};
   if (alphaStr) payload.alpha = Number(alphaStr);
   const includeStr = document.getElementById('new-ft-include').value.trim();
   const excludeStr = document.getElementById('new-ft-exclude').value.trim();

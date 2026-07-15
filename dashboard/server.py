@@ -1458,12 +1458,16 @@ class GradioManager:
             checkpoint_path = _bash_path(_app_path(checkpoint_path))
             if not title:
                 title = checkpoint_name or Path(checkpoint_path).name
-            # Resolve base model from run record
+            # Resolve base model + engine from run record. engine (torch|mlx)
+            # is threaded onto the run_gradio cmd so MLX-trained LoRAs launch
+            # the MLX gradio, matching how they were trained.
             base_model = "sa3-medium"
+            engine = "torch"
             if run_id:
                 run = registry.get_run(run_id)
                 if run:
                     base_model = run.get("base_model", "sa3-medium")
+                    engine = run.get("engine", "torch")
             gmi = _get_model_info(base_model)
             # Choose ARC vs RF base checkpoint
             use_arc_full = (model_variant == "arc" and gmi.get("arc_type") == "full_model")
@@ -1529,6 +1533,7 @@ class GradioManager:
                 f"--model-config {_bash_quote(config_path_model)} "
                 f"--ckpt-path {_bash_quote(ckpt_path_model)} "
                 f"{lora_args} "
+                f"--engine {engine} "
                 f"--model-half "
                 f"--title {shlex.quote(title)}"
                 f"{default_prompt_arg}"
@@ -3716,6 +3721,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         max_steps = int(body.get("max_steps", 20000))
         batch_size = int(body.get("batch_size", 8))
         base_model = body.get("base_model", "sa3-medium")
+        # Engine: torch (default, in-process PyTorch loop) or mlx (Apple-Silicon,
+        # delegates to the sibling MLX trainer). Threaded into the launch cmd as
+        # --engine and stored on the run so resume + "use this checkpoint" match.
+        engine = str(body.get("engine", "torch") or "torch").strip().lower()
+        if engine not in ("torch", "mlx"):
+            engine = "torch"
         lora_type = body.get("lora_type", "lora")  # lora, dora, bora, lora-xs
         rank = int(body.get("rank", 16))
         checkpoint_every = int(body.get("checkpoint_every", 1000))
@@ -4013,6 +4024,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             f"     --max-steps {max_steps}"
             f"     --gradient-clip-val 1.0"
             f"     --logger ''"
+            f"     --engine {engine}"
         )
 
         gpu_env = f"CUDA_VISIBLE_DEVICES={gpu} "
@@ -4027,10 +4039,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         # aren't installed — otherwise the trainer subprocess crashes mid-
         # startup with a cryptic TypeError when the model config hits a
         # conditioner whose kwargs don't match the older backend's API.
-        backend_err = _missing_backend_error_for_model(base_model)
-        if backend_err:
-            self._json_response({"error": backend_err}, status=400)
-            return
+        # engine=mlx trains in a separate MLX venv/checkout, so the in-venv
+        # torch backend need not be installed — skip the torch-backend gate.
+        if engine != "mlx":
+            backend_err = _missing_backend_error_for_model(base_model)
+            if backend_err:
+                self._json_response({"error": backend_err}, status=400)
+                return
         backend_env = _backend_env_for_model(base_model)
         # UNDERFIT_LOG_PATH lets lora_train.py write a sidecar <log>.exit on
         # any unhandled exception — robust to buffering issues that can cause
@@ -4073,6 +4088,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "gpu": gpu,
             "restart_cmd": restart_cmd,
             "base_model": base_model,
+            "engine": engine,
             "dataset_id": dataset_id,
             "dataset_history": [{
                 "dataset_id": dataset_id,

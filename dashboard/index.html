@@ -4758,23 +4758,34 @@ function _randomSeed() { return Math.floor(Math.random() * 91) + 10; } // 10-100
 let _newFtPreset = 8;
 let _newFtPresetUserSet = false; // true once the user clicks a Preset button
 
+// True when the New Finetune engine is MLX (Apple). MLX RF/Base demos take ~50
+// forwards — ~8 min each at full length — so with MLX we suggest ARC-only demos
+// (8 steps). Falls back to RF only when the model has no ARC variant.
+function _engineIsMlx() {
+  return ((document.getElementById('new-ft-engine') || {}).value || 'torch') === 'mlx';
+}
+function _modelHasArc() {
+  const mi = _arcInfo[(document.getElementById('new-ft-base-model') || {}).value] || {};
+  return mi.arc_type === 'full_model' || mi.arc_type === 'lora';
+}
+
 function _defaultNewFtDemos(preset) {
   const model = document.getElementById('new-ft-base-model').value || 'sa3';
   const mi = _arcInfo[model] || {};
   const hasArc = mi.arc_type === 'full_model' || mi.arc_type === 'lora';
   const sampler = mi.diffusion_objective === 'v' ? 'V' : 'Base';
   const baseSteps = mi.diffusion_objective === 'v' ? 100 : 50;
+  // MLX: drop the RF/Base demos (too slow) and suggest ARC-only.
+  const arcOnly = _engineIsMlx() && hasArc;
   if (preset === undefined || preset === null) preset = _newFtPreset;
   if (preset === 2) {
-    const demos = [{prompt: '', sampler, cfg: 7, steps: baseSteps, seed: _randomSeed()}];
+    const demos = arcOnly ? [] : [{prompt: '', sampler, cfg: 7, steps: baseSteps, seed: _randomSeed()}];
     if (hasArc) demos.push({prompt: '', sampler: 'ARC', cfg: 1, steps: 8, seed: _randomSeed()});
     return demos;
   }
   if (preset === 4) {
-    // Order matters: indices used by _populateDemoPrompts to clear prompt for "no prompt" slots.
-    //   idx 0: RF + prompt    idx 1: RF + no prompt
-    //   idx 2: ARC + prompt   idx 3: ARC + no prompt
-    const demos = [
+    // Order matters: indices used by _demoEmptyIdx to clear prompt for "no prompt" slots.
+    const demos = arcOnly ? [] : [
       {prompt: '', sampler, cfg: 7, steps: baseSteps, seed: _randomSeed()},
       {prompt: '', sampler, cfg: 7, steps: baseSteps, seed: _randomSeed()},
     ];
@@ -4787,7 +4798,7 @@ function _defaultNewFtDemos(preset) {
     return demos;
   }
   // preset === 8 (default suite)
-  const demos = [
+  const demos = arcOnly ? [] : [
     {prompt: '', sampler: sampler, cfg: 7, steps: baseSteps, seed: _randomSeed()},
     {prompt: '', sampler: sampler, cfg: 7, steps: baseSteps, seed: _randomSeed()},
     {prompt: '', sampler: sampler, cfg: 1, steps: baseSteps, seed: _randomSeed()},
@@ -4805,19 +4816,25 @@ function _defaultNewFtDemos(preset) {
 }
 
 // "Unconditional" indices per preset — emptied by _populateDemoPrompts after the
-// dataset-driven prompt fill. Two: none. Four: 2nd of each sampler. Eight: 4th
-// RF + 3rd ARC (legacy positions).
-const _DEMO_PRESET_EMPTY_IDX = {2: [], 4: [1, 3], 8: [3, 6]};
+// dataset-driven prompt fill. RF+ARC layout: Two none, Four 2nd of each sampler,
+// Eight 4th RF + 3rd ARC. ARC-only (MLX) drops the RF slots, so the
+// unconditional slot shifts down accordingly.
+function _demoEmptyIdx(preset) {
+  const p = preset || _newFtPreset;
+  const arcOnly = _engineIsMlx() && _modelHasArc();
+  const layout = arcOnly ? {2: [], 4: [1], 8: [2]} : {2: [], 4: [1, 3], 8: [3, 6]};
+  return layout[p] || [];
+}
 
-// Default per-demo duration depending on preset:
-//   Eight  — demos 0 (first RF) and 4 (first ARC) default to the model's native
-//            length so the user always has a long-form reference; the rest use
-//            the training crop length.
-//   Two/Four — every demo defaults to the training crop length. These presets
-//            exist for quick previews on slow GPUs; full-length defeats the point.
+// Default per-demo duration: the first demo of each sampler gets the model's
+// native (full) length as a long-form reference (preset 8 only); the rest use
+// the training crop length. RF+ARC → idx 0 (RF) + 4 (ARC); ARC-only (MLX) → the
+// first ARC is idx 0.
 function _defaultDemoDurationLatents(idx, cropLen, nativeLen) {
-  if (_newFtPreset === 8 && (idx === 0 || idx === 4)) return nativeLen;
-  return cropLen;
+  if (_newFtPreset !== 8) return cropLen;
+  const arcOnly = _engineIsMlx() && _modelHasArc();
+  const nativeIdx = arcOnly ? [0] : [0, 4];
+  return nativeIdx.includes(idx) ? nativeLen : cropLen;
 }
 
 let _newFtDemos = _defaultNewFtDemos(8);
@@ -5084,13 +5101,13 @@ window.setDemoPreset = function(n) {
 };
 
 window.newFtGoStep4 = function() {
-  // First entry (not cloned, user hasn't manually picked): auto-pick by GPU.
+  // First entry (not cloned, user hasn't manually picked): auto-pick by GPU and
+  // rebuild the default demos with the CURRENT engine (MLX → ARC-only). Always
+  // rebuild here (not only when the preset changes) so the engine-aware default
+  // applies even when the preset is unchanged; prompts are repopulated below.
   if (!_newFtDemosCloned && !_newFtPresetUserSet) {
-    const auto = _pickPresetForGpu();
-    if (auto !== _newFtPreset) {
-      _newFtPreset = auto;
-      _newFtDemos = _defaultNewFtDemos(auto);
-    }
+    _newFtPreset = _pickPresetForGpu();
+    _newFtDemos = _defaultNewFtDemos(_newFtPreset);
   }
   _updatePresetUI();
   // Populate demo prompts from the prompt config heuristic (skip if cloned)
@@ -5182,7 +5199,7 @@ function _populateDemoPrompts(preset) {
   }
   // Clear prompts for the preset's "unconditional" slots — Two has none,
   // Four clears the second of each sampler, Eight clears idx 3 + 6.
-  const emptyIdx = _DEMO_PRESET_EMPTY_IDX[preset || _newFtPreset] || [];
+  const emptyIdx = _demoEmptyIdx(preset);
   for (const i of emptyIdx) {
     if (_newFtDemos.length > i) _newFtDemos[i].prompt = '';
   }

@@ -316,11 +316,12 @@ def _write_demo_config(entries):
 # --------------------------------------------------------------------------- #
 # Command builders
 # --------------------------------------------------------------------------- #
-def build_trainer_cmd(args, base_weights):
+def build_trainer_cmd(args, base_weights=None):
     """Map Underfit's args + run configs onto the locked lora_train_mlx.py CLI.
 
-    Reads args.model_config / args.dataset_config (paths). base_weights is the
-    resolved --dit-weights npz path (see resolve_base_weights).
+    Reads args.model_config / args.dataset_config (paths). base_weights is an
+    optional --dit-weights override; when None the MLX trainer auto-downloads
+    the base-model npz from HF (its default), so no local file is required.
     """
     mlx_root, mlx_python = resolve_mlx_paths()
     trainer = os.path.join(mlx_root, "scripts", "lora_train_mlx.py")
@@ -337,12 +338,13 @@ def build_trainer_cmd(args, base_weights):
     cmd = [
         mlx_python, trainer,
         "--dit", dit,
-        "--dit-weights", str(base_weights),
         "--latents-dir", latents_dir,
         "--lr", _fmt(lr),
         "--name", str(args.name),
         "--save-dir", str(args.save_dir),
     ]
+    if base_weights:  # override only; else the trainer downloads the base npz
+        cmd[2:2] = ["--dit-weights", str(base_weights)]
 
     _add(cmd, "--batch-size", getattr(args, "batch_size", None))
     _add(cmd, "--seed", getattr(args, "seed", None))
@@ -447,13 +449,19 @@ def run_mlx_training(args):
     """
     model_config = _load_json(args.model_config)
     dit = _dit_model_from_config(model_config)
-    base_weights = resolve_base_weights(dit)
-    if not os.path.isfile(base_weights):
-        raise FileNotFoundError(
-            f"MLX base weights not found at {base_weights!r}. Set "
-            f"UNDERFIT_MLX_BASE_WEIGHTS or place the npz at "
-            f"<UNDERFIT_MLX_ROOT>/models/mlx/dit_{dit}-base_f16.npz."
-        )
+    # Base weights: pass an explicit --dit-weights only for the override env, or
+    # if a local base npz happens to exist. Otherwise leave it off — the MLX
+    # trainer auto-downloads the base-model npz from HF (weights.TRAINING_BASE).
+    override = os.environ.get("UNDERFIT_MLX_BASE_WEIGHTS")
+    if override:
+        base_weights = os.path.abspath(override)
+        if not os.path.isfile(base_weights):
+            raise FileNotFoundError(
+                f"UNDERFIT_MLX_BASE_WEIGHTS={base_weights!r} does not exist."
+            )
+    else:
+        default = resolve_base_weights(dit)
+        base_weights = default if os.path.isfile(default) else None
 
     cmd = build_trainer_cmd(args, base_weights)
     print("[mlx-engine] launching MLX trainer:", flush=True)

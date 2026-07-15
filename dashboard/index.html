@@ -1481,6 +1481,16 @@
         <span id="new-ft-demo-every-display" style="color:var(--text1);font-size:0.9em"></span>
         <span style="color:var(--text2);font-size:0.8em">steps</span>
       </div>
+      <!-- SA3-medium only: decode demos with the small SAME-S autoencoder
+           instead of SAME-L (~1.6× faster, near-identical — corr 0.99). Default
+           on for Apple/MLX (where SAME-L decode is a big share of demo time),
+           off elsewhere. -->
+      <div id="new-ft-same-s-row" style="display:none;align-items:center;gap:8px;margin-bottom:12px">
+        <label class="modal-label" style="margin:0;display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="new-ft-same-s-demos" onchange="_sameSUserSet=true">
+          Use SAME-S for demos (faster)
+        </label>
+      </div>
       <div id="new-ft-demo-entries" style="display:flex;flex-direction:column;gap:8px;max-height:50vh;overflow-y:auto;margin-bottom:12px"></div>
       <div style="display:flex;gap:8px;align-items:center">
         <button class="modal-launch" onclick="addNewFtDemo()" style="background:var(--green);padding:4px 14px;font-size:0.85em">+</button>
@@ -4769,6 +4779,24 @@ function _modelHasArc() {
   return mi.arc_type === 'full_model' || mi.arc_type === 'lora';
 }
 
+// SA3-medium only: the "Use SAME-S for demos (faster)" checkbox. Default on for
+// Apple/MLX (SAME-L decode is a big share of demo time there), off elsewhere;
+// _sameSUserSet preserves an explicit toggle for the rest of the modal session.
+let _sameSUserSet = false;
+function _updateSameSDemoOption() {
+  const row = document.getElementById('new-ft-same-s-row');
+  const cb = document.getElementById('new-ft-same-s-demos');
+  if (!row || !cb) return;
+  const isMedium = (document.getElementById('new-ft-base-model') || {}).value === 'sa3-medium';
+  row.style.display = isMedium ? 'flex' : 'none';
+  if (isMedium && !_sameSUserSet) cb.checked = (_platform === 'apple');
+}
+function _useSameSForDemos() {
+  const cb = document.getElementById('new-ft-same-s-demos');
+  return (document.getElementById('new-ft-base-model') || {}).value === 'sa3-medium'
+    && cb && cb.checked;
+}
+
 function _defaultNewFtDemos(preset) {
   const model = document.getElementById('new-ft-base-model').value || 'sa3';
   const mi = _arcInfo[model] || {};
@@ -5117,6 +5145,7 @@ window.newFtGoStep4 = function() {
   document.getElementById('new-ft-step4').style.display = '';
   document.getElementById('new-ft-demo-every-display').textContent =
     document.getElementById('new-ft-demo-every').value || '1000';
+  _updateSameSDemoOption();   // SA3-medium: show + default the SAME-S demo toggle
   _renderDemoEntries();
 };
 
@@ -6206,6 +6235,7 @@ window.openNewFinetuneModal = async function() {
   // Reset demos state — auto-pick preset will run when user reaches Step 4
   _newFtPreset = 8;
   _newFtPresetUserSet = false;
+  _sameSUserSet = false;   // re-default the SAME-S demo toggle per modal session
   _newFtDemos = _defaultNewFtDemos(8);
   _newFtDemosCloned = false;
   // Reset Step 2 state
@@ -6420,6 +6450,9 @@ window.confirmNewFinetune = async function() {
     }
     return entry;
   });
+  // SA3-medium: decode demos with SAME-S instead of the model's SAME-L when the
+  // "faster demos" toggle is on (default on for Apple/MLX).
+  if (_useSameSForDemos()) payload.demo_decoder = 'same-s';
   // Build ground_truth from source files used to generate each demo prompt
   payload.ground_truth = _newFtDemos.map(d => {
     const f = d.sourceFile;

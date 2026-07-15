@@ -499,6 +499,8 @@ def build_trainer_cmd(args, base_weights=None):
         if entries:
             _add(cmd, "--demo-config", _write_demo_config(entries))
             _add(cmd, "--demo-every", demo_every)
+            # SA3-medium "faster demos": decode with SAME-S instead of SAME-L.
+            _add(cmd, "--demo-decoder", demo.get("demo_decoder"))
 
     return cmd
 

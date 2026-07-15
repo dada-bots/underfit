@@ -4023,6 +4023,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             cfg["training"].setdefault("demo", {})["demo_every"] = demo_every
             cfg["training"]["demo"]["demo_mode"] = "lora_dashboard"
             cfg["training"]["demo"]["latent_crop_length"] = body.get("latent_crop_length", mi["latent_crop_length"])
+            # SA3-medium (MLX): decode demos with SAME-S instead of SAME-L when
+            # the "faster demos" toggle is on — the MLX trainer honors this via
+            # --demo-decoder (mlx_engine); the torch loop keeps its own decoder.
+            if body.get("demo_decoder"):
+                cfg["training"]["demo"]["demo_decoder"] = body["demo_decoder"]
             # Apply custom demo_cond from frontend if provided
             if custom_demo_cond:
                 # Compute seconds_total from the actual latent crop length

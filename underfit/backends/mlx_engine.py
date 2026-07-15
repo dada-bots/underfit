@@ -264,11 +264,33 @@ def _resolve_offsets(training, resume_path):
     return step, epoch
 
 
-def _write_demo_config(demo):
-    """Write the demo block to a temp json and return its path."""
+def _build_demo_entries(demo):
+    """Map underfit's `training.demo` block onto the MLX trainer's --demo-config,
+    which is a flat LIST of entries {prompt, cfg, seed, steps, lora_strength?,
+    lora_interval_max?}. ARC entries are skipped: the MLX trainer finetunes the
+    BASE model, and ARC demos need a weight-swap/second-model it doesn't do."""
+    cfg_scales = demo.get("demo_cfg_scales") or [7]
+    default_cfg = cfg_scales[0] if cfg_scales else 7
+    default_steps = demo.get("demo_steps", 50)
+    entries = []
+    for e in demo.get("demo_cond") or []:
+        if e.get("arc"):
+            continue
+        entry = {"prompt": e.get("prompt", ""),
+                 "cfg": e.get("cfg", default_cfg),
+                 "steps": e.get("steps", default_steps)}
+        for k in ("seed", "lora_strength", "lora_interval_max"):
+            if e.get(k) is not None:
+                entry[k] = e[k]
+        entries.append(entry)
+    return entries
+
+
+def _write_demo_config(entries):
+    """Write the MLX --demo-config entry list to a temp json and return its path."""
     fd, path = tempfile.mkstemp(prefix="underfit_mlx_demo_", suffix=".json")
     with os.fdopen(fd, "w") as f:
-        json.dump(demo, f)
+        json.dump(entries, f)
     return path
 
 
@@ -335,8 +357,10 @@ def build_trainer_cmd(args, base_weights):
     demo = training.get("demo") or {}
     demo_every = demo.get("demo_every")
     if demo.get("demo_cond") and demo_every:
-        _add(cmd, "--demo-config", _write_demo_config(demo))
-        _add(cmd, "--demo-every", demo_every)
+        entries = _build_demo_entries(demo)
+        if entries:
+            _add(cmd, "--demo-config", _write_demo_config(entries))
+            _add(cmd, "--demo-every", demo_every)
 
     return cmd
 

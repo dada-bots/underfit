@@ -1535,6 +1535,10 @@ class GradioManager:
                 f"--ckpt-path {_bash_quote(ckpt_path_model)} "
                 f"{lora_args} "
                 f"--engine {engine} "
+                # base_model name for engine=mlx: the run's _model.json has no
+                # top-level 'base_model', so resolve_dit_model needs it here to
+                # pick the --dit value (the torch path ignores --pretrained-name).
+                f"--pretrained-name {shlex.quote(base_model)} "
                 f"--model-half "
                 f"--title {shlex.quote(title)}"
                 f"{default_prompt_arg}"

@@ -2726,6 +2726,20 @@ def _cuda_env_prefix(gpu):
     return f"CUDA_VISIBLE_DEVICES={gpu} "
 
 
+def _available_engines(plat):
+    """Training engines the dashboard can actually launch. 'mlx' on Apple (the
+    MLX checkout brings its own stack); 'torch' only where a torch backend
+    (stable_audio_3 / stable_audio_tools) is importable — never list an engine
+    whose backend isn't installed, since a greyed, unusable option (e.g. MPS on
+    an MLX-only Mac) is worse than its absence."""
+    import importlib.util
+    torch_ok = any(importlib.util.find_spec(m) is not None
+                   for m in ("stable_audio_3", "stable_audio_tools"))
+    if plat == "apple":
+        return ["mlx"] + (["torch"] if torch_ok else [])
+    return ["torch"]
+
+
 def _get_gpu_count(force_refresh=False):
     """Return number of CUDA GPUs from nvidia-smi (cached after the first
     *successful* call). Returns 0 if nvidia-smi is missing or fails — the UI
@@ -5283,7 +5297,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         resp = {"gpus": gpus, "gradio_estimate": _gradio_vram, "arc_info": arc_info,
                 "platform": plat,
-                "engines": ["torch", "mlx"] if plat == "apple" else ["torch"]}
+                "engines": _available_engines(plat)}
         if visible_gpus is not None:
             resp["cuda_visible_devices"] = visible_gpus
         return resp

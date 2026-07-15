@@ -3806,6 +3806,7 @@ function _applyEngineOptions() {
   const sel = document.getElementById('new-ft-engine');
   if (!sel) return;
   const hasMlx = _engines.includes('mlx');
+  const hasTorch = _engines.includes('torch');
   const isApple = _platform === 'apple';
   Array.from(sel.options).forEach(o => {
     if (o.value === 'mlx') {
@@ -3813,6 +3814,10 @@ function _applyEngineOptions() {
       o.disabled = !hasMlx;
       o.textContent = isApple ? 'MLX' : 'mlx';
     } else if (o.value === 'torch') {
+      // Hide MPS/torch when no torch backend is installed — an unusable engine
+      // option is worse than its absence (server omits it from _engines).
+      o.hidden = !hasTorch;
+      o.disabled = !hasTorch;
       o.textContent = isApple ? 'MPS' : 'torch';
     }
   });
@@ -5833,6 +5838,10 @@ window.handleSeedLoraFile = async function(ev) {
 };
 
 function updateCkptEstimate() {
+  // Don't overwrite a validation error currently shown in this element — the
+  // onchanges call validateNewFt() then updateCkptEstimate(), so the error
+  // (set by validateNewFt) must win over the size estimate.
+  if (window._newFtHasBlockingErr) return;
   const el = document.getElementById('new-ft-ckpt-estimate');
   const model = document.getElementById('new-ft-base-model').value;
   const type = document.getElementById('new-ft-lora-type').value;
@@ -6317,6 +6326,10 @@ window.validateNewFt = function() {
     else nameLabelEl.innerHTML = 'Run name';
   }
   btn.disabled = !!error;
+  // Flag a blocking error shown in `el` so a following updateCkptEstimate()
+  // (onchanges call both) doesn't clobber the message — previously the error
+  // only surfaced on a name change, leaving Next greyed with no warning.
+  window._newFtHasBlockingErr = !!(error && !isNameError && !isMlxDl);
   if (error && !isNameError && !isMlxDl) { el.style.color = 'var(--red)'; el.textContent = error; }
   else { el.style.color = 'var(--yellow)'; updateCkptEstimate(); }
   updateLayerPreview();

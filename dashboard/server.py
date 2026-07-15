@@ -6287,9 +6287,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         if _detect_platform() == "apple":
             # MLX SAME encoder (torch-free) — no torch base checkpoint, no CUDA.
-            # Writes the same npy+json (+ details.json) layout pre_encode.py does.
+            # Write into latent_dir (output_dir/latents/<model>) — the exact dir the
+            # torch pre_encode.py targets and the encoding monitor checks for
+            # details.json + *.npy. (pre_encode_mlx writes flat into --output-dir,
+            # so point it AT latent_dir rather than output_dir.)
             from underfit.backends import mlx_engine
-            encode_args = mlx_engine.build_encode_cmd(input_path, output_dir, model)
+            latent_dir.mkdir(parents=True, exist_ok=True)
+            encode_args = mlx_engine.build_encode_cmd(input_path, latent_dir, model)
             if exclude_set:
                 print(f"[encode] mlx encoder does not yet honor the exclude list "
                       f"({len(exclude_set)} file(s)) — encoding the full folder.")

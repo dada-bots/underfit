@@ -435,6 +435,23 @@ def build_gradio_cmd(model, lora_ckpt_paths, share=False, port=None):
     return cmd
 
 
+def build_encode_cmd(input_dir, output_dir, base_model):
+    """Map the dashboard's encode request onto pre_encode_mlx.py (the torch-free
+    MLX SAME encoder). base_model → codec: small (sm-music/sm-sfx) → same-s,
+    medium → same-l. The encoder weights (SAME npz) are auto-downloaded / local
+    in the MLX checkout — no torch base checkpoint needed."""
+    mlx_root, mlx_python = resolve_mlx_paths()
+    script = os.path.join(mlx_root, "scripts", "pre_encode_mlx.py")
+    if not os.path.isfile(script):
+        raise FileNotFoundError(
+            f"MLX pre-encode script not found at {script!r}. Point "
+            f"UNDERFIT_MLX_ROOT at the stable-audio-3/optimized/mlx checkout."
+        )
+    codec = "same-l" if map_model_name(base_model) == "medium" else "same-s"
+    return [mlx_python, script, "--audio-dir", str(input_dir),
+            "--output-dir", str(output_dir), "--codec", codec]
+
+
 # --------------------------------------------------------------------------- #
 # Runners
 # --------------------------------------------------------------------------- #

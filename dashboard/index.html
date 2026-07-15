@@ -7670,7 +7670,9 @@ window.validateNewDataset = function() {
   const modelMeta = _remoteModels[modelKey] || {};
   const errEl = document.getElementById('ds-encode-error');
   const btn = document.getElementById('ds-encode-btn');
-  if (modelKey && modelMeta.registered === false) {
+  // On Apple the dashboard encodes with the MLX SAME encoder (own npz), so the
+  // torch base checkpoint ('registered') isn't required.
+  if (modelKey && modelMeta.registered === false && _platform !== 'apple') {
     errEl.textContent = `Base model "${modelMeta.label || modelKey}" not downloaded — please run installer again`;
     btn.disabled = true;
   } else {
@@ -7818,7 +7820,7 @@ window.launchEncoding = async function() {
   const modelMeta = _remoteModels[model] || {};
   const gpus = Array.from(_dsSelectedGpus).sort();
   const errEl = document.getElementById('ds-encode-error');
-  if (model && modelMeta.registered === false) {
+  if (model && modelMeta.registered === false && _platform !== 'apple') {
     errEl.textContent = `Base model "${modelMeta.label || model}" not downloaded — please run installer again`;
     return;
   }

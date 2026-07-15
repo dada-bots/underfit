@@ -6285,25 +6285,36 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             exclude_file = output_dir / "exclude.txt"
             exclude_file.write_text("\n".join(sorted(exclude_set)) + "\n")
 
-        encode_args = [
-            str(VENV_PYTHON),
-            str(PRE_DIR / "pre_encode.py"),
-            "--input-dir", str(input_path),
-            "--model", model,
-            "--output-dir", str(output_dir),
-            "--num-gpus", str(len(gpus)),
-        ]
-        if half:
-            encode_args.append("--half")
-        if exclude_file is not None:
-            encode_args.extend(["--exclude-file", str(exclude_file)])
+        if _detect_platform() == "apple":
+            # MLX SAME encoder (torch-free) — no torch base checkpoint, no CUDA.
+            # Writes the same npy+json (+ details.json) layout pre_encode.py does.
+            from underfit.backends import mlx_engine
+            encode_args = mlx_engine.build_encode_cmd(input_path, output_dir, model)
+            if exclude_set:
+                print(f"[encode] mlx encoder does not yet honor the exclude list "
+                      f"({len(exclude_set)} file(s)) — encoding the full folder.")
+            encode_env = os.environ.copy()
+            encode_env.update({"PYTHONUNBUFFERED": "1"})
+        else:
+            encode_args = [
+                str(VENV_PYTHON),
+                str(PRE_DIR / "pre_encode.py"),
+                "--input-dir", str(input_path),
+                "--model", model,
+                "--output-dir", str(output_dir),
+                "--num-gpus", str(len(gpus)),
+            ]
+            if half:
+                encode_args.append("--half")
+            if exclude_file is not None:
+                encode_args.extend(["--exclude-file", str(exclude_file)])
 
-        encode_env = os.environ.copy()
-        encode_env.update({
-            "CUDA_VISIBLE_DEVICES": gpu_str,
-            "PYTHONUNBUFFERED": "1",
-            "MPLBACKEND": "Agg",
-        })
+            encode_env = os.environ.copy()
+            encode_env.update({
+                "CUDA_VISIBLE_DEVICES": gpu_str,
+                "PYTHONUNBUFFERED": "1",
+                "MPLBACKEND": "Agg",
+            })
 
         log_handle = None
         try:

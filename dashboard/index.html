@@ -5567,6 +5567,11 @@ function _escAttr(s) {
 // disabled-Next/disabled-Encode logic still runs alongside this.
 window._warnUnregisteredModel = function(modelKey) {
   if (!modelKey) return;
+  // On Apple the MLX engine (New Finetune) and the MLX SAME encoder (Encode
+  // Dataset) bring their own base npz — auto-downloaded / local in the MLX
+  // checkout — so the torch 'registered' flag doesn't gate usage here. Matches
+  // the validateNewFt (engine!=mlx) and encode (_platform!=apple) guards.
+  if (_platform === 'apple') return;
   const meta = _remoteModels[modelKey] || {};
   if (meta.registered !== false) return;
   const label = _escAttr(meta.label || modelKey);

@@ -2737,7 +2737,11 @@ def _get_gpu_count(force_refresh=False):
 
 
 def _query_gpu_mem():
-    """Return dict of gpu_index -> used_mb from nvidia-smi."""
+    """Return dict of gpu_index -> used_mb. CUDA: nvidia-smi per GPU. Apple: the
+    single unified-memory accelerator (index 0) via vm_stat, so the VRAM history
+    sampler and per-run VRAM chart populate on Apple Silicon too."""
+    if _detect_platform() == "apple":
+        return {0: _apple_gpu_mem_used_mb()}
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=index,memory.used",
@@ -3574,7 +3578,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json_response({"error": "missing checkpoint_path or gpu"}, status=400)
                 return
             gpu = int(gpu)
-            if gpu < 0 or gpu >= _get_gpu_count():
+            # On CUDA, validate against the nvidia-smi GPU count. On Apple/CPU
+            # there's a single implicit accelerator (index 0) and nvidia-smi
+            # reports 0 GPUs, so skip the check — the MLX/MPS launch ignores the
+            # index anyway (CUDA_VISIBLE_DEVICES is only set on CUDA).
+            if _detect_platform() == "cuda" and (gpu < 0 or gpu >= _get_gpu_count()):
                 self._json_response({"error": f"gpu must be 0-{_get_gpu_count()-1}"}, status=400)
                 return
             instance_id, err = gradio_manager.launch(
@@ -4478,11 +4486,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         gpu = body.get("gpu", run.get("gpu"))
         gpu_env = _cuda_env_prefix(gpu)
         # Refuse the resume up front if the run's declared backends aren't
-        # installed (see _missing_backend_error_for_model docstring).
-        backend_err = _missing_backend_error_for_model(run.get("base_model"))
-        if backend_err:
-            self._json_response({"error": backend_err}, status=400)
-            return
+        # installed (see _missing_backend_error_for_model docstring). engine=mlx
+        # trains in a separate MLX venv/checkout, so the in-venv torch backend
+        # need not be installed — skip the gate (mirrors the fresh-launch path).
+        if run.get("engine", "torch") != "mlx":
+            backend_err = _missing_backend_error_for_model(run.get("base_model"))
+            if backend_err:
+                self._json_response({"error": backend_err}, status=400)
+                return
         backend_env = _backend_env_for_model(run.get("base_model"))
         demo_dir = run.get("demo_source_dir", str(RUNS_DIR))
         os.makedirs(demo_dir, exist_ok=True)
@@ -5240,8 +5251,92 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             resp["cuda_visible_devices"] = visible_gpus
         return resp
 
+    def _descendant_pids(self, pid):
+        """Set of all descendant PIDs of pid (recursive pgrep -P)."""
+        found = set()
+        frontier = [int(pid)]
+        while frontier:
+            p = frontier.pop()
+            try:
+                kids = subprocess.check_output(
+                    ["pgrep", "-P", str(p)], stderr=subprocess.DEVNULL
+                ).decode().split()
+            except Exception:
+                kids = []
+            for k in kids:
+                ki = int(k)
+                if ki not in found:
+                    found.add(ki)
+                    frontier.append(ki)
+        return found
+
+    def _apple_gpu_processes(self):
+        """Apple unified-memory accelerator processes: the dashboard-managed
+        training / gradio / encoding runs that are alive, each reporting the RSS
+        of its whole process tree as used_mb (Apple has no per-process VRAM —
+        RSS on unified memory is the closest analog). Uses ps/pgrep, not
+        nvidia-smi or /proc, so it works on macOS."""
+        def _alive(pid):
+            try:
+                os.kill(int(pid), 0)
+                return True
+            except Exception:
+                return False
+
+        def _tree_rss_mb(pid):
+            try:
+                pids = self._descendant_pids(pid) | {int(pid)}
+                total_kb = 0
+                for p in pids:
+                    out = subprocess.check_output(
+                        ["ps", "-o", "rss=", "-p", str(p)],
+                        stderr=subprocess.DEVNULL,
+                    ).decode().strip()
+                    if out:
+                        total_kb += int(out.split()[0])
+                return total_kb // 1024
+            except Exception:
+                return 0
+
+        procs = []
+        for r in registry.list_runs():
+            if r.get("status") in ("completed", "killed"):
+                continue
+            pid = r.get("pid")
+            if pid and _alive(pid):
+                procs.append({
+                    "pid": pid, "used_mb": _tree_rss_mb(pid), "type": "training",
+                    "name": r.get("display_name", r["id"]), "run_id": r["id"],
+                })
+        for inst in gradio_manager.list_instances():
+            if inst["status"] not in ("starting", "ready"):
+                continue
+            pid = inst.get("pid")
+            if pid and _alive(pid):
+                procs.append({
+                    "pid": pid, "used_mb": _tree_rss_mb(pid), "type": "gradio",
+                    "name": inst.get("title") or inst.get("checkpoint_name", "?"),
+                    "run_id": inst.get("run_id"),
+                    "checkpoint_path": inst.get("checkpoint_path"),
+                    "instance_id": inst["id"],
+                })
+        for ds in datasets_registry.list_datasets():
+            if ds["status"] != "encoding":
+                continue
+            pid = ds.get("encoding_pid")
+            if pid and _alive(pid):
+                procs.append({
+                    "pid": pid, "used_mb": _tree_rss_mb(pid), "type": "encoding",
+                    "name": ds["name"], "dataset_id": ds["id"],
+                })
+        procs.sort(key=lambda p: p["used_mb"], reverse=True)
+        return procs
+
     def _get_gpu_processes(self, gpu_idx):
-        """Return classified processes running on a specific GPU."""
+        """Return classified processes running on a specific GPU (CUDA), or the
+        dashboard-managed accelerator processes on Apple unified memory."""
+        if _detect_platform() == "apple":
+            return self._apple_gpu_processes()
         # Query nvidia-smi for compute processes
         try:
             out = subprocess.check_output(

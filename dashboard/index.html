@@ -1283,7 +1283,7 @@
         </div>
         <div>
           <label class="modal-label">Engine</label>
-          <select class="modal-select" id="new-ft-engine" title="torch: in-process PyTorch loop (MPS/CUDA/CPU). mlx: Apple-Silicon MLX trainer in the sibling stable-audio-3 checkout.">
+          <select class="modal-select" id="new-ft-engine" onchange="validateNewFt();updateCkptEstimate()" title="torch: in-process PyTorch loop (MPS/CUDA/CPU). mlx: Apple-Silicon MLX trainer in the sibling stable-audio-3 checkout.">
             <option value="torch" selected>torch</option>
             <option value="mlx">mlx</option>
           </select>
@@ -3811,7 +3811,7 @@ function _applyEngineOptions() {
       o.disabled = !hasMlx;
       o.textContent = isApple ? 'MLX' : 'mlx';
     } else if (o.value === 'torch') {
-      o.textContent = isApple ? 'MPS (PyTorch)' : 'torch';
+      o.textContent = isApple ? 'MPS' : 'torch';
     }
   });
   const cur = sel.options[sel.selectedIndex];
@@ -6201,9 +6201,13 @@ window.validateNewFt = function() {
   const btn = document.getElementById('new-ft-next-btn');
   const baseModelKey = document.getElementById('new-ft-base-model').value;
   const baseModelMeta = _remoteModels[baseModelKey] || {};
+  // The 'registered' check is the torch base checkpoint. The MLX engine brings
+  // its own base npz (auto-downloaded / local in the MLX checkout), so the torch
+  // download isn't required for an mlx run.
+  const _ftEngine = (document.getElementById('new-ft-engine') || {}).value || 'torch';
   let error = '';
   if (_newFtNoDatasets) error = 'Create a dataset first';
-  else if (baseModelKey && baseModelMeta.registered === false)
+  else if (baseModelKey && baseModelMeta.registered === false && _ftEngine !== 'mlx')
     error = `Base model "${baseModelMeta.label || baseModelKey}" not downloaded — please run installer again`;
   else if (!name) error = '_name_empty';
   else if (runsData.some(r => r.display_name === name)) error = `Run "${name}" already exists`;

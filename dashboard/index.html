@@ -5105,9 +5105,16 @@ function _pickPresetForGpu() {
 }
 
 function _updatePresetUI() {
+  // MLX (ARC-only) demos drop the RF half, so a preset yields half the demos —
+  // relabel the buttons One/Two/Four to match the actual count. Non-MLX keeps
+  // Two/Four/Eight (half RF + half ARC).
+  const arcOnly = _engineIsMlx() && _modelHasArc();
+  const labels = arcOnly ? {2: 'One', 4: 'Two', 8: 'Four'}
+                         : {2: 'Two', 4: 'Four', 8: 'Eight'};
   for (const k of [2, 4, 8]) {
     const btn = document.getElementById('new-ft-preset-' + k);
     if (!btn) continue;
+    btn.textContent = labels[k];
     if (_newFtPreset === k) {
       btn.classList.remove('modal-cancel');
       btn.classList.add('modal-launch');

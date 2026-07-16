@@ -846,6 +846,7 @@ def debug_info(state_dir: str = "/content/drive/MyDrive/underfit-state",
         print(f"  torch:  {torch.__version__}  (CUDA {torch.version.cuda})")
         print(f"  archs:  {torch.cuda.get_arch_list()}")
         print(f"  cuda available: {torch.cuda.is_available()}")
+        print(f"  mps available:  {torch.backends.mps.is_available()}")
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 name = torch.cuda.get_device_name(i)

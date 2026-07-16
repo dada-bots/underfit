@@ -826,6 +826,59 @@ def run_model_phase(args, backend: Backend) -> int:
 # ── ENTRY POINT ──────────────────────────────────────────────────────────────
 
 
+def maybe_download_mlx_packs(args) -> int:
+    """Apple-only: pre-download the MLX weight packs (base + ARC + SAME codec +
+    encoder + shared t5gemma) into the existing MLX checkout so the first MLX
+    finetune / dataset-encode doesn't stall. Reuses underfit.backends.mlx_engine
+    — the same download the dashboard's on-demand button uses (item 5). Degrades
+    gracefully: if the MLX checkout / venv isn't set up, the weights just
+    download lazily on first use instead."""
+    import subprocess as _sp
+    try:
+        from underfit.backends import mlx_engine
+    except Exception as e:
+        print(f"\n(could not import the MLX engine — {e}. MLX weights will "
+              f"download on first use.)")
+        return 0
+    root = mlx_engine.mlx_root_or_none()
+    if not root:
+        print("\n▸ Apple Silicon detected, but the MLX checkout wasn't found.\n"
+              "  Set UNDERFIT_MLX_ROOT (or clone stable-audio-3 as a sibling and\n"
+              "  create its .venv). MLX weights will download on first use.")
+        return 0
+    all_keys = [p.key for p in SA3_PACKS]
+    if args.models:
+        wanted = {s.strip() for s in args.models.split(",") if s.strip()}
+        keys = [k for k in all_keys if k in wanted]
+    else:
+        keys = all_keys
+    print(f"\n▸ MLX weight packs → {os.path.join(root, 'models', 'mlx')}")
+    rc = 0
+    for key in keys:
+        try:
+            dit = mlx_engine.map_model_name(key)
+        except Exception:
+            continue
+        if mlx_engine.mlx_model_available(dit):
+            print(f"  ✓ {dit}: already present")
+            continue
+        _missing, gb = mlx_engine.mlx_missing_pack(dit)
+        print(f"  ↓ {dit}: downloading ~{gb} GB …", flush=True)
+        try:
+            cmd = mlx_engine.build_mlx_download_cmd(dit)
+        except FileNotFoundError as e:
+            print(f"    skipped — {e}")
+            rc = 1
+            continue
+        try:
+            _sp.run(cmd, cwd=root, check=True)
+            print(f"  ✓ {dit}: done")
+        except Exception as e:
+            print(f"    download failed ({e}) — will retry on first use")
+            rc = 1
+    return rc
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="underfit-setup",
@@ -872,6 +925,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.skip_models:
         print("\n(skipping model phase as requested)")
         return 0
+
+    import platform as _pf
+    if _pf.system() == "Darwin" and _pf.machine() == "arm64":
+        # Apple Silicon: the MLX engine (Metal GPU) is the primary path, so
+        # download the MLX weight packs. The torch packs (run_model_phase) are
+        # only needed for the torch/MPS engine — skip them here to avoid pulling
+        # ~10 GB of torch weights an MLX-only Mac won't use.
+        return maybe_download_mlx_packs(args)
 
     return run_model_phase(args, backend)
 

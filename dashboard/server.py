@@ -607,8 +607,9 @@ def _kill_process_group(pid, paused=False):
 
 
 def _free_gpu_memory(gpu):
-    """Run cuda.empty_cache() on the specified GPU to free VRAM."""
-    if gpu is None:
+    """Run cuda.empty_cache() on the specified GPU to free VRAM. CUDA-only —
+    a no-op on Apple (MPS/MLX) / CPU, where there's no per-GPU CUDA cache."""
+    if gpu is None or _detect_platform() != "cuda":
         return
     try:
         cmd = (
@@ -1458,12 +1459,16 @@ class GradioManager:
             checkpoint_path = _bash_path(_app_path(checkpoint_path))
             if not title:
                 title = checkpoint_name or Path(checkpoint_path).name
-            # Resolve base model from run record
+            # Resolve base model + engine from run record. engine (torch|mlx)
+            # is threaded onto the run_gradio cmd so MLX-trained LoRAs launch
+            # the MLX gradio, matching how they were trained.
             base_model = "sa3-medium"
+            engine = "torch"
             if run_id:
                 run = registry.get_run(run_id)
                 if run:
                     base_model = run.get("base_model", "sa3-medium")
+                    engine = run.get("engine", "torch")
             gmi = _get_model_info(base_model)
             # Choose ARC vs RF base checkpoint
             use_arc_full = (model_variant == "arc" and gmi.get("arc_type") == "full_model")
@@ -1522,13 +1527,18 @@ class GradioManager:
             # a non-IPython subprocess (matplotlib crashes on import).
             cmd = (
                 f"source {_bash_quote(VENV_ACTIVATE)} && "
-                f"{backend_env}CUDA_VISIBLE_DEVICES={gpu} GRADIO_SERVER_PORT={port} "
+                f"{backend_env}{_cuda_env_prefix(gpu)}GRADIO_SERVER_PORT={port} "
                 f"PYTHONUNBUFFERED=1 MPLBACKEND=Agg "
                 f"{thread_env}"
                 f"python {_bash_quote(RUN_GRADIO_SCRIPT)} "
                 f"--model-config {_bash_quote(config_path_model)} "
                 f"--ckpt-path {_bash_quote(ckpt_path_model)} "
                 f"{lora_args} "
+                f"--engine {engine} "
+                # base_model name for engine=mlx: the run's _model.json has no
+                # top-level 'base_model', so resolve_dit_model needs it here to
+                # pick the --dit value (the torch path ignores --pretrained-name).
+                f"--pretrained-name {shlex.quote(base_model)} "
                 f"--model-half "
                 f"--title {shlex.quote(title)}"
                 f"{default_prompt_arg}"
@@ -2209,7 +2219,7 @@ class TrainingMonitor:
                     if "--gradient-clip-val" not in restart_cmd:
                         restart_cmd += "     --gradient-clip-val 1.0"
                     # Restart training and append stdout/stderr to the log file.
-                    gpu_env = f"CUDA_VISIBLE_DEVICES={gpu} " if gpu is not None else ""
+                    gpu_env = _cuda_env_prefix(gpu)
                     backend_env = _backend_env_for_model(fresh_run.get("base_model"))
                     demo_dir = fresh_run.get("demo_source_dir", str(RUNS_DIR))
                     os.makedirs(demo_dir, exist_ok=True)
@@ -2558,6 +2568,14 @@ _gradio_vram_lock = threading.Lock()
 _gradio_vram = {"load_mb": 10000, "peak_mb": 12000, "n_samples": 0}
 _gradio_vram_baselines = {}  # instance_id -> {"gpu": int, "before_mb": int, "measured": bool}
 
+# MLX model-pack downloads (Apple on-demand, item 5). dit -> {proc, log, started}.
+# Each is a subprocess running mlx_engine.build_mlx_download_cmd (weights.
+# ensure_local for the base+arc+codec+t5 pack) with stdout tee'd to a log the
+# status endpoint tails for progress.
+_mlx_downloads = {}
+_mlx_downloads_lock = threading.Lock()
+_MLX_DOWNLOAD_DIR = STATE_FILES_DIR / "mlx_downloads"
+
 
 def _load_gradio_vram_estimate():
     global _gradio_vram
@@ -2626,6 +2644,106 @@ def _update_gradio_vram_estimates():
             _gradio_vram_baselines.pop(iid, None)
 
 
+_PLATFORM_CACHE = None
+
+
+def _detect_platform():
+    """Accelerator platform: 'apple' (Apple-Silicon / Metal — MPS + MLX),
+    'cuda' (nvidia-smi GPUs present), or 'cpu'. Torch-free so it works even when
+    the training backend isn't importable in this venv. Cached for the session."""
+    global _PLATFORM_CACHE
+    if _PLATFORM_CACHE is None:
+        import platform as _pf
+        if _pf.system() == "Darwin" and _pf.machine() == "arm64":
+            _PLATFORM_CACHE = "apple"
+        elif _get_gpu_count() > 0:
+            _PLATFORM_CACHE = "cuda"
+        else:
+            _PLATFORM_CACHE = "cpu"
+    return _PLATFORM_CACHE
+
+
+_APPLE_INFO_CACHE = None
+
+
+def _apple_gpu_info():
+    """Static Apple-Silicon accelerator info — the Metal counterpart of the
+    nvidia-smi query. Uses `system_profiler SPDisplaysDataType` for the chip/GPU
+    name (+ core count when present) and `sysctl hw.memsize` for the unified
+    memory total. Cached (hardware is fixed for the session)."""
+    global _APPLE_INFO_CACHE
+    if _APPLE_INFO_CACHE is not None:
+        return _APPLE_INFO_CACHE
+    name, cores = "Apple GPU", None
+    try:
+        out = subprocess.check_output(
+            ["system_profiler", "-json", "SPDisplaysDataType"],
+            timeout=10, stderr=subprocess.DEVNULL,
+        ).decode()
+        disp = json.loads(out).get("SPDisplaysDataType", [])
+        if disp:
+            d0 = disp[0]
+            name = d0.get("sppci_model") or d0.get("_name") or name
+            raw_cores = d0.get("sppci_cores") or d0.get("spdisplays_ndrvs")
+            if raw_cores:
+                try:
+                    cores = int(str(raw_cores).split()[0])
+                except (ValueError, IndexError):
+                    pass
+    except Exception:
+        pass
+    mem_total_mb = 0
+    try:
+        mem_total_mb = int(subprocess.check_output(
+            ["sysctl", "-n", "hw.memsize"], timeout=5,
+        ).decode().strip()) // (1024 * 1024)
+    except Exception:
+        pass
+    _APPLE_INFO_CACHE = {"name": name, "cores": cores, "mem_total_mb": mem_total_mb}
+    return _APPLE_INFO_CACHE
+
+
+def _apple_gpu_mem_used_mb():
+    """Live unified-memory used (MB) via `vm_stat` — the closest analog to CUDA
+    memory.used on Apple's unified-memory GPU (active + wired + compressed)."""
+    try:
+        out = subprocess.check_output(["vm_stat"], timeout=5).decode()
+        m = re.search(r"page size of (\d+) bytes", out)
+        pgsize = int(m.group(1)) if m else 16384
+
+        def _pages(label):
+            mm = re.search(rf"{label}:\s+(\d+)\.", out)
+            return int(mm.group(1)) if mm else 0
+        used = (_pages("Pages active") + _pages("Pages wired down")
+                + _pages("Pages occupied by compressor"))
+        return used * pgsize // (1024 * 1024)
+    except Exception:
+        return 0
+
+
+def _cuda_env_prefix(gpu):
+    """`CUDA_VISIBLE_DEVICES=<gpu> ` prefix for a launch command — empty on
+    non-CUDA platforms. Apple (MPS/MLX) uses its single device implicitly and
+    CPU has none, so pinning CUDA_VISIBLE_DEVICES there is meaningless."""
+    if gpu is None or _detect_platform() != "cuda":
+        return ""
+    return f"CUDA_VISIBLE_DEVICES={gpu} "
+
+
+def _available_engines(plat):
+    """Training engines the dashboard can actually launch. 'mlx' on Apple (the
+    MLX checkout brings its own stack); 'torch' only where a torch backend
+    (stable_audio_3 / stable_audio_tools) is importable — never list an engine
+    whose backend isn't installed, since a greyed, unusable option (e.g. MPS on
+    an MLX-only Mac) is worse than its absence."""
+    import importlib.util
+    torch_ok = any(importlib.util.find_spec(m) is not None
+                   for m in ("stable_audio_3", "stable_audio_tools"))
+    if plat == "apple":
+        return ["mlx"] + (["torch"] if torch_ok else [])
+    return ["torch"]
+
+
 def _get_gpu_count(force_refresh=False):
     """Return number of CUDA GPUs from nvidia-smi (cached after the first
     *successful* call). Returns 0 if nvidia-smi is missing or fails — the UI
@@ -2645,7 +2763,11 @@ def _get_gpu_count(force_refresh=False):
 
 
 def _query_gpu_mem():
-    """Return dict of gpu_index -> used_mb from nvidia-smi."""
+    """Return dict of gpu_index -> used_mb. CUDA: nvidia-smi per GPU. Apple: the
+    single unified-memory accelerator (index 0) via vm_stat, so the VRAM history
+    sampler and per-run VRAM chart populate on Apple Silicon too."""
+    if _detect_platform() == "apple":
+        return {0: _apple_gpu_mem_used_mb()}
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=index,memory.used",
@@ -3172,7 +3294,32 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
         elif path == "/api/models":
-            self._json_response({"models": MODELS_UI_PAYLOAD})
+            payload = MODELS_UI_PAYLOAD
+            # On Apple, annotate each model with whether its MLX weight pack
+            # (base + arc + codec + encoder + t5) is present, so the UI can
+            # offer an on-demand download instead of the torch 'registered' flag.
+            if _detect_platform() == "apple":
+                try:
+                    from underfit.backends import mlx_engine
+                    payload = {}
+                    for k, v in MODELS_UI_PAYLOAD.items():
+                        vv = dict(v)
+                        try:
+                            vv["mlx_available"] = mlx_engine.mlx_model_available(k)
+                            _miss, _gb = mlx_engine.mlx_missing_pack(
+                                mlx_engine.map_model_name(k))
+                            vv["mlx_download_gb"] = _gb
+                        except Exception:
+                            vv["mlx_available"] = None
+                        payload[k] = vv
+                except Exception:
+                    payload = MODELS_UI_PAYLOAD
+            self._json_response({"models": payload})
+        elif path == "/api/models/download":
+            # Status of an on-demand MLX pack download. ?model=<key>
+            qs = parse_qs(parsed.query)
+            model = (qs.get("model") or [None])[0]
+            self._json_response(self._mlx_download_status(model))
         elif path == "/api/runs":
             self._json_response(self._get_runs())
         elif path == "/api/status":
@@ -3482,7 +3629,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json_response({"error": "missing checkpoint_path or gpu"}, status=400)
                 return
             gpu = int(gpu)
-            if gpu < 0 or gpu >= _get_gpu_count():
+            # On CUDA, validate against the nvidia-smi GPU count. On Apple/CPU
+            # there's a single implicit accelerator (index 0) and nvidia-smi
+            # reports 0 GPUs, so skip the check — the MLX/MPS launch ignores the
+            # index anyway (CUDA_VISIBLE_DEVICES is only set on CUDA).
+            if _detect_platform() == "cuda" and (gpu < 0 or gpu >= _get_gpu_count()):
                 self._json_response({"error": f"gpu must be 0-{_get_gpu_count()-1}"}, status=400)
                 return
             instance_id, err = gradio_manager.launch(
@@ -3498,6 +3649,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json_response({"error": err}, status=409)
             else:
                 self._json_response({"id": instance_id}, status=201)
+        elif parsed.path == "/api/models/download":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._start_mlx_download(body.get("model"))
         elif parsed.path == "/api/runs/new":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
@@ -3716,6 +3871,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         max_steps = int(body.get("max_steps", 20000))
         batch_size = int(body.get("batch_size", 8))
         base_model = body.get("base_model", "sa3-medium")
+        # Engine: torch (default, in-process PyTorch loop) or mlx (Apple-Silicon,
+        # delegates to the sibling MLX trainer). Threaded into the launch cmd as
+        # --engine and stored on the run so resume + "use this checkpoint" match.
+        engine = str(body.get("engine", "torch") or "torch").strip().lower()
+        if engine not in ("torch", "mlx"):
+            engine = "torch"
         lora_type = body.get("lora_type", "lora")  # lora, dora, bora, lora-xs
         rank = int(body.get("rank", 16))
         checkpoint_every = int(body.get("checkpoint_every", 1000))
@@ -3862,6 +4023,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             cfg["training"].setdefault("demo", {})["demo_every"] = demo_every
             cfg["training"]["demo"]["demo_mode"] = "lora_dashboard"
             cfg["training"]["demo"]["latent_crop_length"] = body.get("latent_crop_length", mi["latent_crop_length"])
+            # SA3-medium (MLX): decode demos with SAME-S instead of SAME-L when
+            # the "faster demos" toggle is on — the MLX trainer honors this via
+            # --demo-decoder (mlx_engine); the torch loop keeps its own decoder.
+            if body.get("demo_decoder"):
+                cfg["training"]["demo"]["demo_decoder"] = body["demo_decoder"]
             # Apply custom demo_cond from frontend if provided
             if custom_demo_cond:
                 # Compute seconds_total from the actual latent crop length
@@ -4013,9 +4179,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             f"     --max-steps {max_steps}"
             f"     --gradient-clip-val 1.0"
             f"     --logger ''"
+            f"     --engine {engine}"
         )
 
-        gpu_env = f"CUDA_VISIBLE_DEVICES={gpu} "
+        gpu_env = _cuda_env_prefix(gpu)
         # Cap CPU thread pools (same rationale as gradio launches: nproc-sized
         # default pools can exhaust ulimit -u when multiple training procs are
         # alive). Tied to GRADIO_THREAD_CAP for consistency.
@@ -4027,10 +4194,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         # aren't installed — otherwise the trainer subprocess crashes mid-
         # startup with a cryptic TypeError when the model config hits a
         # conditioner whose kwargs don't match the older backend's API.
-        backend_err = _missing_backend_error_for_model(base_model)
-        if backend_err:
-            self._json_response({"error": backend_err}, status=400)
-            return
+        # engine=mlx trains in a separate MLX venv/checkout, so the in-venv
+        # torch backend need not be installed — skip the torch-backend gate.
+        if engine != "mlx":
+            backend_err = _missing_backend_error_for_model(base_model)
+            if backend_err:
+                self._json_response({"error": backend_err}, status=400)
+                return
         backend_env = _backend_env_for_model(base_model)
         # UNDERFIT_LOG_PATH lets lora_train.py write a sidecar <log>.exit on
         # any unhandled exception — robust to buffering issues that can cause
@@ -4073,6 +4243,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "gpu": gpu,
             "restart_cmd": restart_cmd,
             "base_model": base_model,
+            "engine": engine,
             "dataset_id": dataset_id,
             "dataset_history": [{
                 "dataset_id": dataset_id,
@@ -4373,13 +4544,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         # Launch — use GPU from request body if provided, else fall back to run's previous GPU
         gpu = body.get("gpu", run.get("gpu"))
-        gpu_env = f"CUDA_VISIBLE_DEVICES={gpu} " if gpu is not None else ""
+        gpu_env = _cuda_env_prefix(gpu)
         # Refuse the resume up front if the run's declared backends aren't
-        # installed (see _missing_backend_error_for_model docstring).
-        backend_err = _missing_backend_error_for_model(run.get("base_model"))
-        if backend_err:
-            self._json_response({"error": backend_err}, status=400)
-            return
+        # installed (see _missing_backend_error_for_model docstring). engine=mlx
+        # trains in a separate MLX venv/checkout, so the in-venv torch backend
+        # need not be installed — skip the gate (mirrors the fresh-launch path).
+        if run.get("engine", "torch") != "mlx":
+            backend_err = _missing_backend_error_for_model(run.get("base_model"))
+            if backend_err:
+                self._json_response({"error": backend_err}, status=400)
+                return
         backend_env = _backend_env_for_model(run.get("base_model"))
         demo_dir = run.get("demo_source_dir", str(RUNS_DIR))
         os.makedirs(demo_dir, exist_ok=True)
@@ -5001,31 +5175,46 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         """Query nvidia-smi and annotate GPUs with training/gradio labels.
         Generous timeout because the first nvidia-smi call on a fresh Colab
         VM can take 5–10 s while the driver initializes."""
+        plat = _detect_platform()
         gpus = []
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=index,memory.used,memory.total,memory.free,utilization.gpu",
-                 "--format=csv,noheader,nounits"],
-                timeout=15, stderr=subprocess.DEVNULL,
-            ).decode().strip()
-            for line in out.split("\n"):
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) < 5:
-                    continue
-                gpus.append({
-                    "gpu": int(parts[0]),
-                    "used_mb": int(parts[1]),
-                    "total_mb": int(parts[2]),
-                    "free_mb": int(parts[3]),
-                    "util_pct": int(parts[4]),
-                    "labels": [],
-                })
-        except Exception:
-            return {"gpus": [], "gradio_estimate": _gradio_vram}
-
-        caps = _query_gpu_compute_caps()
-        for g in gpus:
-            g["compute_cap"] = caps.get(g["gpu"])
+        if plat == "apple":
+            # Single unified-memory Metal device — usable via MPS (torch) or MLX.
+            info = _apple_gpu_info()
+            used = _apple_gpu_mem_used_mb()
+            total = info["mem_total_mb"]
+            gpus = [{
+                "gpu": 0, "kind": "apple",
+                "name": info["name"], "cores": info.get("cores"),
+                "used_mb": used, "total_mb": total,
+                "free_mb": max(0, total - used), "util_pct": 0,
+                "labels": [], "compute_cap": None,
+            }]
+        elif plat == "cuda":
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=index,memory.used,memory.total,memory.free,utilization.gpu",
+                     "--format=csv,noheader,nounits"],
+                    timeout=15, stderr=subprocess.DEVNULL,
+                ).decode().strip()
+                for line in out.split("\n"):
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 5:
+                        continue
+                    gpus.append({
+                        "gpu": int(parts[0]),
+                        "used_mb": int(parts[1]),
+                        "total_mb": int(parts[2]),
+                        "free_mb": int(parts[3]),
+                        "util_pct": int(parts[4]),
+                        "labels": [],
+                    })
+            except Exception:
+                return {"gpus": [], "platform": "cuda", "engines": ["torch"],
+                        "gradio_estimate": _gradio_vram}
+            caps = _query_gpu_compute_caps()
+            for g in gpus:
+                g["compute_cap"] = caps.get(g["gpu"])
+        # plat == "cpu": no accelerator device; gpus stays [].
 
         # Build lookup: gpu -> used_mb for checking occupancy
         gpu_mem = {g["gpu"]: g["used_mb"] for g in gpus}
@@ -5115,13 +5304,181 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         else:
             visible_gpus = None  # not set = all visible
 
-        resp = {"gpus": gpus, "gradio_estimate": _gradio_vram, "arc_info": arc_info}
+        resp = {"gpus": gpus, "gradio_estimate": _gradio_vram, "arc_info": arc_info,
+                "platform": plat,
+                "engines": _available_engines(plat)}
         if visible_gpus is not None:
             resp["cuda_visible_devices"] = visible_gpus
         return resp
 
+    def _start_mlx_download(self, model):
+        """Kick off (or report) an on-demand MLX pack download for `model`.
+        Apple-only; the pack (base + arc + codec + encoder + t5) is fetched into
+        the existing MLX checkout via the MLX venv's weights.ensure_local."""
+        if _detect_platform() != "apple":
+            self._json_response(
+                {"error": "MLX model download is Apple-only."}, status=400)
+            return
+        try:
+            from underfit.backends import mlx_engine
+            dit = mlx_engine.map_model_name(model)
+        except Exception as e:
+            self._json_response({"error": str(e)}, status=400)
+            return
+        if mlx_engine.mlx_model_available(model):
+            self._json_response({"ok": True, "state": "available"})
+            return
+        with _mlx_downloads_lock:
+            cur = _mlx_downloads.get(dit)
+            if cur and cur["proc"].poll() is None:
+                self._json_response({"ok": True, "state": "downloading", "dit": dit})
+                return
+            try:
+                cmd = mlx_engine.build_mlx_download_cmd(dit)
+                mlx_root, _ = mlx_engine.resolve_mlx_paths()
+            except FileNotFoundError as e:
+                self._json_response({"error": str(e)}, status=400)
+                return
+            _MLX_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = _MLX_DOWNLOAD_DIR / f"{dit}.log"
+            try:
+                logf = open(log_path, "w")
+            except OSError as e:
+                self._json_response({"error": str(e)}, status=500)
+                return
+            env = dict(os.environ)
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            proc = subprocess.Popen(
+                cmd, cwd=mlx_root, stdout=logf, stderr=subprocess.STDOUT, env=env)
+            _mlx_downloads[dit] = {
+                "proc": proc, "log": str(log_path), "started": time.time()}
+        self._json_response(
+            {"ok": True, "state": "downloading", "dit": dit}, status=201)
+
+    def _mlx_download_status(self, model):
+        """Progress of an on-demand MLX pack download for `model`."""
+        try:
+            from underfit.backends import mlx_engine
+            dit = mlx_engine.map_model_name(model)
+        except Exception as e:
+            return {"state": "error", "error": str(e), "available": False}
+        available = mlx_engine.mlx_model_available(model)
+        total = len(mlx_engine.mlx_pack_rel_paths(dit))
+        with _mlx_downloads_lock:
+            cur = _mlx_downloads.get(dit)
+        state = "available" if available else "idle"
+        done_files, current = 0, None
+        if cur:
+            rc = cur["proc"].poll()
+            try:
+                log = Path(cur["log"]).read_text()
+            except Exception:
+                log = ""
+            oks = set(re.findall(r"OK (\S+)", log))
+            dls = re.findall(r"DL (\S+)", log)
+            done_files = len(oks)
+            pending = [d for d in dls if d not in oks]
+            current = os.path.basename(pending[-1]) if pending else None
+            if rc is None:
+                state = "downloading"
+            elif "ALL_DONE" in log or available:
+                state = "done"
+            else:
+                state = "error"
+        return {
+            "state": state, "available": available,
+            "done_files": done_files, "total_files": total,
+            "current_file": current,
+            "remaining_gb": (mlx_engine.mlx_missing_pack(dit)[1]
+                             if not available else 0),
+        }
+
+    def _descendant_pids(self, pid):
+        """Set of all descendant PIDs of pid (recursive pgrep -P)."""
+        found = set()
+        frontier = [int(pid)]
+        while frontier:
+            p = frontier.pop()
+            try:
+                kids = subprocess.check_output(
+                    ["pgrep", "-P", str(p)], stderr=subprocess.DEVNULL
+                ).decode().split()
+            except Exception:
+                kids = []
+            for k in kids:
+                ki = int(k)
+                if ki not in found:
+                    found.add(ki)
+                    frontier.append(ki)
+        return found
+
+    def _apple_gpu_processes(self):
+        """Apple unified-memory accelerator processes: the dashboard-managed
+        training / gradio / encoding runs that are alive, each reporting the RSS
+        of its whole process tree as used_mb (Apple has no per-process VRAM —
+        RSS on unified memory is the closest analog). Uses ps/pgrep, not
+        nvidia-smi or /proc, so it works on macOS."""
+        def _alive(pid):
+            try:
+                os.kill(int(pid), 0)
+                return True
+            except Exception:
+                return False
+
+        def _tree_rss_mb(pid):
+            try:
+                pids = self._descendant_pids(pid) | {int(pid)}
+                total_kb = 0
+                for p in pids:
+                    out = subprocess.check_output(
+                        ["ps", "-o", "rss=", "-p", str(p)],
+                        stderr=subprocess.DEVNULL,
+                    ).decode().strip()
+                    if out:
+                        total_kb += int(out.split()[0])
+                return total_kb // 1024
+            except Exception:
+                return 0
+
+        procs = []
+        for r in registry.list_runs():
+            if r.get("status") in ("completed", "killed"):
+                continue
+            pid = r.get("pid")
+            if pid and _alive(pid):
+                procs.append({
+                    "pid": pid, "used_mb": _tree_rss_mb(pid), "type": "training",
+                    "name": r.get("display_name", r["id"]), "run_id": r["id"],
+                })
+        for inst in gradio_manager.list_instances():
+            if inst["status"] not in ("starting", "ready"):
+                continue
+            pid = inst.get("pid")
+            if pid and _alive(pid):
+                procs.append({
+                    "pid": pid, "used_mb": _tree_rss_mb(pid), "type": "gradio",
+                    "name": inst.get("title") or inst.get("checkpoint_name", "?"),
+                    "run_id": inst.get("run_id"),
+                    "checkpoint_path": inst.get("checkpoint_path"),
+                    "instance_id": inst["id"],
+                })
+        for ds in datasets_registry.list_datasets():
+            if ds["status"] != "encoding":
+                continue
+            pid = ds.get("encoding_pid")
+            if pid and _alive(pid):
+                procs.append({
+                    "pid": pid, "used_mb": _tree_rss_mb(pid), "type": "encoding",
+                    "name": ds["name"], "dataset_id": ds["id"],
+                })
+        procs.sort(key=lambda p: p["used_mb"], reverse=True)
+        return procs
+
     def _get_gpu_processes(self, gpu_idx):
-        """Return classified processes running on a specific GPU."""
+        """Return classified processes running on a specific GPU (CUDA), or the
+        dashboard-managed accelerator processes on Apple unified memory."""
+        if _detect_platform() == "apple":
+            return self._apple_gpu_processes()
         # Query nvidia-smi for compute processes
         try:
             out = subprocess.check_output(
@@ -6165,25 +6522,38 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             exclude_file = output_dir / "exclude.txt"
             exclude_file.write_text("\n".join(sorted(exclude_set)) + "\n")
 
-        encode_args = [
-            str(VENV_PYTHON),
-            str(PRE_DIR / "pre_encode.py"),
-            "--input-dir", str(input_path),
-            "--model", model,
-            "--output-dir", str(output_dir),
-            "--num-gpus", str(len(gpus)),
-        ]
-        if half:
-            encode_args.append("--half")
-        if exclude_file is not None:
-            encode_args.extend(["--exclude-file", str(exclude_file)])
+        if _detect_platform() == "apple":
+            # MLX SAME encoder (torch-free) — no torch base checkpoint, no CUDA.
+            # Write into latent_dir (output_dir/latents/<model>) — the exact dir the
+            # torch pre_encode.py targets and the encoding monitor checks for
+            # details.json + *.npy. (pre_encode_mlx writes flat into --output-dir,
+            # so point it AT latent_dir rather than output_dir.)
+            from underfit.backends import mlx_engine
+            latent_dir.mkdir(parents=True, exist_ok=True)
+            encode_args = mlx_engine.build_encode_cmd(
+                input_path, latent_dir, model, exclude_file=exclude_file)
+            encode_env = os.environ.copy()
+            encode_env.update({"PYTHONUNBUFFERED": "1"})
+        else:
+            encode_args = [
+                str(VENV_PYTHON),
+                str(PRE_DIR / "pre_encode.py"),
+                "--input-dir", str(input_path),
+                "--model", model,
+                "--output-dir", str(output_dir),
+                "--num-gpus", str(len(gpus)),
+            ]
+            if half:
+                encode_args.append("--half")
+            if exclude_file is not None:
+                encode_args.extend(["--exclude-file", str(exclude_file)])
 
-        encode_env = os.environ.copy()
-        encode_env.update({
-            "CUDA_VISIBLE_DEVICES": gpu_str,
-            "PYTHONUNBUFFERED": "1",
-            "MPLBACKEND": "Agg",
-        })
+            encode_env = os.environ.copy()
+            encode_env.update({
+                "CUDA_VISIBLE_DEVICES": gpu_str,
+                "PYTHONUNBUFFERED": "1",
+                "MPLBACKEND": "Agg",
+            })
 
         log_handle = None
         try:
@@ -6470,6 +6840,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         if not os.path.isdir(ckpt_subdir):
                             continue
                         for f in os.scandir(ckpt_subdir):
+                            if f.name.startswith("."):
+                                continue  # hidden scratch (e.g. .arc_demo_tmp — MLX ARC-demo temp LoRA)
                             if f.name.endswith(".safetensors"):
                                 all_ckpts[f.path] = (Path(f.path), f.stat())
                             elif f.name.endswith(".ckpt"):

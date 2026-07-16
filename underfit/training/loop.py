@@ -33,6 +33,12 @@ from underfit.utils import (
     remove_weight_norm_from_model,
     stream_checkpoint_into_model,
 )
+from underfit.utils.device import (
+    autocast_context,
+    make_grad_scaler,
+    resolve_device,
+    resolve_pin_memory,
+)
 
 
 class _NullCtx:
@@ -292,7 +298,7 @@ def run_training(args, backend):
         # mmap'd safetensors, copies straight to GPU, releases CPU side).
         # Cuts peak CPU RAM from ~14 GB to ~6 GB for SA3-medium — the
         # difference between OOM and not on a 13 GB Colab T4.
-        device_for_load = "cuda" if torch.cuda.is_available() else "cpu"
+        device_for_load = resolve_device()
         result = stream_checkpoint_into_model(
             model, args.pretrained_ckpt_path,
             device=device_for_load,
@@ -316,7 +322,7 @@ def run_training(args, backend):
     if args.remove_pretransform_weight_norm == "post_load":
         remove_weight_norm_from_model(model.pretransform)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_device()
     print(f"[startup] Moving model to {device} …", flush=True)
     model.to(device)
 
@@ -368,7 +374,8 @@ def run_training(args, backend):
     # Dataloader perf knobs — see defaults.ini for context. Default-on,
     # CLI-overridable. persistent_workers is silently disabled when
     # num_workers=0 since PyTorch raises in that case.
-    _pin_memory = bool(getattr(args, "pin_memory", True))
+    # pin_memory is CUDA-only (MPS warns and ignores it) — auto-off elsewhere.
+    _pin_memory = resolve_pin_memory(getattr(args, "pin_memory", True), device)
     _persistent = bool(getattr(args, "persistent_workers", True)) and effective_workers > 0
     train_dl = backend.create_dataloader(
         dataset_config,
@@ -401,9 +408,10 @@ def run_training(args, backend):
     # Without it, the conditioner forward sees fp16 inputs hitting fp32 LoRA-
     # parametrized weights and crashes with a Half/Float dtype mismatch.
     autocast_dtype, use_grad_scaler = _resolve_amp(getattr(args, "precision", None))
-    grad_scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
+    grad_scaler = make_grad_scaler(device) if use_grad_scaler else None
     if autocast_dtype is not None:
-        print(f"AMP: autocast={autocast_dtype}, grad_scaler={grad_scaler is not None}", flush=True)
+        _scaler_on = grad_scaler is not None and grad_scaler.is_enabled()
+        print(f"AMP: autocast={autocast_dtype} on {device}, grad_scaler={_scaler_on}", flush=True)
 
     # --- Step + epoch offsets for resume ---
     # Resolution order: training_config.{step,epoch}_offset > safetensors metadata >
@@ -523,7 +531,7 @@ def run_training(args, backend):
                 reals = reals.to(device)
 
                 amp_ctx = (
-                    torch.amp.autocast("cuda", dtype=autocast_dtype)
+                    autocast_context(device, dtype=autocast_dtype)
                     if autocast_dtype is not None
                     else _NullCtx()
                 )

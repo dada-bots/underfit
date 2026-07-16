@@ -30,6 +30,49 @@ Open the URL in a browser, click **+ New Dataset** to star
 ---
 
 
+## Quickstart — Apple Silicon (Mac, MLX)
+
+On an Apple-Silicon Mac, underfit trains on the **Metal GPU via MLX** — no CUDA,
+no PyTorch training loop. It drives the pure-MLX SA3 trainer in the sibling
+[stable-audio-3](https://github.com/Stability-AI/stable-audio-3) `optimized/mlx`
+runtime, which is fast (an M4 Pro finetunes the medium model at a usable clip).
+
+```bash
+# 1. Clone underfit and stable-audio-3 as siblings
+git clone https://github.com/dada-bots/underfit
+git clone https://github.com/Stability-AI/stable-audio-3
+
+# 2. Set up the MLX runtime — its own venv + the MLX weight packs (base + ARC + codec + T5)
+cd stable-audio-3/optimized/mlx && ./install.sh && cd -
+
+# 3. Install the dashboard's Python deps (skip the torch-backend wizard — unused on MLX)
+cd underfit && ./install.sh --no-setup
+
+# 4. Launch with the MLX engine (auto-finds the sibling optimized/mlx checkout)
+UNDERFIT_ENGINE=mlx ./run.sh          # dashboard on http://localhost:8787
+```
+
+Then drive the dashboard exactly as on Linux, with a few Apple niceties:
+
+- The **Engine** dropdown in *New Finetune* shows **MLX** (MPS/torch is hidden
+  unless a torch backend is installed).
+- Dataset **encoding is torch-free** — the MLX SAME encoder, no torch checkpoint.
+- If a model's MLX weights aren't present, *New Finetune* / *Encode* offer a
+  **one-click download** into the MLX checkout (base + ARC pair together).
+- For **SA3-medium** the demo defaults are tuned for MLX — **ARC-only, 8-step,
+  SAME-S decode** — so demos render in seconds instead of the ~8 min a 50-step
+  full-length RF demo would take.
+
+If `stable-audio-3/` isn't a sibling of `underfit/`, point at it explicitly:
+`UNDERFIT_MLX_ROOT=/path/to/stable-audio-3/optimized/mlx` (and
+`UNDERFIT_MLX_PYTHON` for its venv's python).
+
+> Prefer the raw trainer CLI without the dashboard? The MLX runtime ships a
+> standalone LoRA-training CLI — see
+> [optimized/mlx → LoRA training](https://github.com/Stability-AI/stable-audio-3/tree/main/optimized/mlx#lora-training).
+
+---
+
 ## Quickstart — Google Colab
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dada-bots/underfit/blob/main/underfit-colab.ipynb) 
@@ -42,18 +85,19 @@ Jankier than running locally, but still works. Read more here: https://github.co
 
 |                | |
 |---             |---|
-| **OS**         | Linux. (Windows untested.) |
-| **GPU**        | NVIDIA. ≥16 GB VRAM ideal. 8 GB still works with minimal settings: fp16 base model + low rank + small latent crop + batch 1 |
+| **OS**         | Linux (NVIDIA) or macOS (Apple Silicon, via **MLX**). Windows untested. |
+| **GPU**        | NVIDIA — ≥16 GB VRAM ideal, 8 GB works minimally (fp16 base + low rank + small latent crop + batch 1). Or **Apple Silicon** (M1–M4) on the MLX engine — unified memory, 16 GB+ recommended for medium. |
 | **Python**     | 3.10 (auto-fetched by `uv`). |
 | **Disk**       | Plan for ~17 GB per SA3-medium pack, ~7 GB per small pack. All three = ~31 GB of checkpoints. Datasets add a few hundred MB each. |
 | **HF account** | Free. Needed to accept the [SA3 license](https://huggingface.co/stabilityai/stable-audio-3-medium) once. |
 
-| GPU tier   | Fit | Notes |
+| Hardware   | Fit | Notes |
 |---         |---|---|
 | H100 (80GB)| ✅ | Great. Very fast. Holds many finetunes per GPU |
 | A100 / L4  / G4 / 4090 | ✅ | Comfortable. |
 | T4 (16GB)  | ⚠️ | Slow, requires patience, but works. |
-| Mac | ❌ | In theory we could support training on MPS, but it would be very slow. |
+| **Apple Silicon (M1–M4)** | ✅ | Trains on the Metal GPU via the **MLX engine** — see the [Apple-Silicon quickstart](#quickstart--apple-silicon-mac-mlx). Fast on M-series (an M4 Pro finetunes medium at a usable clip). |
+| Mac (Intel) / MPS-torch | ❌ | No MLX (needs Apple Silicon). The torch/MPS training loop exists but is far too slow to recommend. |
 | CPU only   | ❌ | Won't train. |
 
 ---

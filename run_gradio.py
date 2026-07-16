@@ -40,6 +40,16 @@ from underfit.backends import get_backend
 
 
 def main(args):
+    # --- MLX engine: delegate to the sibling stable-audio-3 MLX gradio. ---
+    # Purely additive; the torch path below is unchanged for engine=torch.
+    engine = (getattr(args, "engine", None) or os.environ.get("UNDERFIT_ENGINE") or "torch").strip().lower()
+    if engine == "mlx":
+        from underfit.backends import mlx_engine
+        model = mlx_engine.resolve_dit_model(args.model_config, args.pretrained_name)
+        port_env = os.environ.get("GRADIO_SERVER_PORT")
+        port = int(port_env) if port_env and port_env.isdigit() else None
+        sys.exit(mlx_engine.run_mlx_gradio(model, args.lora_ckpt_path, share=True, port=port))
+
     backend = get_backend(args.backend)
     print(f"Using backend: {backend.NAME}", flush=True)
 
@@ -73,6 +83,10 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run gradio interface (Underfit)")
     parser.add_argument("--backend", default=None, help="sat | sa3 (default: env UNDERFIT_BACKEND or auto)")
+    parser.add_argument("--engine", default=None, choices=["torch", "mlx"],
+                        help="torch | mlx (default: env UNDERFIT_ENGINE, else torch). "
+                             "mlx launches the Apple-Silicon MLX gradio in the sibling "
+                             "stable-audio-3 checkout.")
     parser.add_argument("--pretrained-name", type=str, required=False)
     parser.add_argument("--model-config", type=str, required=False)
     parser.add_argument("--ckpt-path", type=str, required=False)

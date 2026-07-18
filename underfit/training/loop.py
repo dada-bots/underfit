@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import struct
 import sys
@@ -178,6 +179,77 @@ class _LossByTimestepLog:
         if self._f is not None:
             self._f.close()
             self._f = None
+
+
+class _BestCheckpointTracker:
+    """Tracks an EMA of the training loss and saves a best checkpoint
+    whenever the EMA hits a new low at the end of each epoch (after an
+    optional warmup period). Keeps only the last `keep_n` best files.
+
+    Design notes:
+      - Checked at each epoch boundary (not per-step and not only at
+        interval checkpoints) — gives finer granularity than save_every
+        without the cost of writing on every single step.
+      - Compares an EMA of per-step loss, not raw loss — raw loss is too
+        noisy; a single lucky batch would trigger a spurious "best."
+      - `best_so_far` survives a resume: every regular checkpoint stamps
+        the current best into its safetensors metadata (best_ema_loss
+        kwarg on save_lora_step), so resuming from any checkpoint recovers
+        the right value without a separate sidecar file.
+      - Does its own save_lora_step call (not a copy of a regular
+        checkpoint) since epoch boundaries don't align with save_every.
+      - Keeps only the last `keep_n` best files (oldest deleted first).
+      - underfit has no validation loss, so this is a train-loss proxy —
+        it can reflect overfitting, not genuine held-out generalization.
+    """
+    def __init__(self, *, alpha=0.05, warmup_steps=0, keep_n=5, best_so_far=None,
+                 check_every_n_epochs=1):
+        self.alpha = alpha
+        self.warmup_steps = warmup_steps
+        self.keep_n = keep_n
+        self.check_every_n_epochs = max(1, int(check_every_n_epochs))
+        self.ema_loss = None
+        self.best_so_far = best_so_far
+        self._saved_paths = []  # oldest-first, for rotation
+
+    def update(self, loss_value):
+        """Call every step with the raw per-step loss; updates the EMA."""
+        if self.ema_loss is None:
+            self.ema_loss = loss_value
+        else:
+            self.ema_loss = self.alpha * loss_value + (1 - self.alpha) * self.ema_loss
+
+    def maybe_save_best(self, *, backend, model, saved_lora_cfg, base_model_name,
+                        global_step, epoch, checkpoint_dir, run_label):
+        """Call at each epoch boundary. If the current EMA loss is a new
+        low (and warmup has passed), saves a best checkpoint via its own
+        save_lora_step call. Returns the saved path, or None if skipped.
+        """
+        if self.ema_loss is None or global_step < self.warmup_steps:
+            return None
+        is_new_best = self.best_so_far is None or self.ema_loss < self.best_so_far
+        if not is_new_best:
+            return None
+        self.best_so_far = self.ema_loss
+
+        best_dir = os.path.join(checkpoint_dir, "best")
+        os.makedirs(best_dir, exist_ok=True)
+        best_name = (f"{run_label}-best-step={global_step}-epoch={epoch}.safetensors"
+                     if run_label else f"best-step={global_step}-epoch={epoch}.safetensors")
+        best_path = os.path.join(best_dir, best_name)
+
+        save_lora_step(backend, model, saved_lora_cfg, best_path,
+                       step=global_step, epoch=epoch, base_model=base_model_name,
+                       best_ema_loss=self.best_so_far)
+        self._saved_paths.append(best_path)
+
+        while len(self._saved_paths) > self.keep_n:
+            old_path = self._saved_paths.pop(0)
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+        return best_path
 
 
 def _explain_model_load_error(exc, model_config):
@@ -429,8 +501,36 @@ def run_training(args, backend):
         os.makedirs(checkpoint_dir, exist_ok=True)
     run_label = re.sub(r"-\d{14}$", "", args.name) if args.name else None
 
-    # --- Loss-by-timestep log ---
-    lbt_log = _LossByTimestepLog(os.path.join(os.getcwd(), "loss_by_timestep.bin"))
+    # --- demos dir: where the dashboard reads loss_by_timestep.bin from.
+    # server.py hardcodes: RUNS_DIR / run_id / "demos" / "loss_by_timestep.bin"
+    # We must write there, not in a custom metrics/ dir, or the dashboard
+    # Loss chart stays blank. Also added to HF sync WATCH list in the notebook
+    # so it persists across sessions.
+    demos_dir = None
+    if args.save_dir and args.name:
+        demos_dir = os.path.join(args.save_dir, args.name, "demos")
+        os.makedirs(demos_dir, exist_ok=True)
+
+    lbt_path = (os.path.join(demos_dir, "loss_by_timestep.bin")
+                if demos_dir else os.path.join(os.getcwd(), "loss_by_timestep.bin"))
+    lbt_log = _LossByTimestepLog(lbt_path)
+
+    # --- TensorBoard (optional — graceful no-op if tensorboard not installed)
+    # Writes tfevents files into a tb/ dir alongside the checkpoints, which
+    # falls under runs/** so the HF sync picks them up automatically.
+    # HF Hub renders a TensorBoard tab on the model page once tfevents files
+    # are present. Logs: loss, grad_norm, lora_magnitude, lr, ema_loss.
+    tb_writer = None
+    if checkpoint_dir:
+        tb_dir = os.path.join(os.path.dirname(checkpoint_dir), "tb")
+        os.makedirs(tb_dir, exist_ok=True)
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_writer = SummaryWriter(log_dir=tb_dir, purge_step=step_offset or 0)
+            print(f"[startup] TensorBoard logging -> {tb_dir}", flush=True)
+        except ImportError:
+            print("[startup] tensorboard not installed — skipping TB logging "
+                  "(pip install tensorboard to enable)", flush=True)
 
     # --- SIGUSR1 manual save ---
     manual_save_requested = [False]
@@ -476,6 +576,36 @@ def run_training(args, backend):
     demo_config = training_config.get("demo", {}) or {}
     demo_every = int(demo_config.get("demo_every", 0))
     last_demo_step = -1
+
+    # --- Best-checkpoint tracking ---
+    # best_so_far is recovered from the resumed checkpoint's metadata (every
+    # checkpoint stamps the current best, not just literal-best ones — see
+    # save_lora_step's best_ema_loss kwarg) so a resume doesn't reset
+    # progress. training_config.best_ema_loss is an explicit override,
+    # same precedence convention as step_offset/epoch_offset above.
+    has_config_best = "best_ema_loss" in training_config
+    config_best = float(training_config["best_ema_loss"]) if has_config_best else None
+    meta_best = None
+    if resume_metadata and "best_ema_loss" in resume_metadata:
+        try:
+            meta_best = float(resume_metadata["best_ema_loss"])
+        except (TypeError, ValueError):
+            pass
+    best_so_far = config_best if has_config_best else meta_best
+
+    best_ckpt_warmup_steps = int(training_config.get("best_checkpoint_warmup_steps", 0) or 0)
+    best_ckpt_keep_n = int(training_config.get("best_checkpoint_keep_n", 5) or 5)
+    best_ckpt_check_every_n = int(training_config.get("best_checkpoint_check_every_n_epochs", 10) or 10)
+    best_tracker = _BestCheckpointTracker(
+        warmup_steps=best_ckpt_warmup_steps,
+        keep_n=best_ckpt_keep_n,
+        check_every_n_epochs=best_ckpt_check_every_n,
+        best_so_far=best_so_far,
+    ) if best_ckpt_warmup_steps >= 0 and training_config.get("best_checkpoint_enabled", False) else None
+    if best_tracker is not None:
+        print(f"[startup] Best-checkpoint tracking enabled (warmup={best_ckpt_warmup_steps} steps, "
+              f"keep_n={best_ckpt_keep_n}, check_every={best_ckpt_check_every_n} epochs, "
+              f"resumed best={best_so_far})", flush=True)
     raw_step = 0
     epoch = epoch_offset
 
@@ -652,6 +782,19 @@ def run_training(args, backend):
 
                 # --- Loss-by-timestep ---
                 lbt_log.write(global_step, t.detach().float().mean().item(), loss.item())
+                if best_tracker is not None:
+                    best_tracker.update(loss.item())
+
+                # --- TensorBoard ---
+                if tb_writer is not None:
+                    tb_writer.add_scalar("train/loss", loss.item(), global_step)
+                    tb_writer.add_scalar("train/lr", lr, global_step)
+                    if grad_norm is not None:
+                        tb_writer.add_scalar("train/grad_norm", grad_norm, global_step)
+                    if lora_mag is not None:
+                        tb_writer.add_scalar("train/lora_magnitude", lora_mag, global_step)
+                    if best_tracker is not None and best_tracker.ema_loss is not None:
+                        tb_writer.add_scalar("train/ema_loss", best_tracker.ema_loss, global_step)
 
                 raw_step += 1
                 global_step = raw_step + step_offset
@@ -684,7 +827,9 @@ def run_training(args, backend):
                             if manual_save_requested[0]:
                                 manual_save_requested[0] = False
                             out = os.path.join(checkpoint_dir, _ckpt_filename(run_label, global_step, epoch))
-                            save_lora_step(backend, model, saved_lora_cfg, out, step=global_step, epoch=epoch, base_model=base_model_name)
+                            current_best = best_tracker.best_so_far if best_tracker is not None else None
+                            save_lora_step(backend, model, saved_lora_cfg, out, step=global_step, epoch=epoch,
+                                            base_model=base_model_name, best_ema_loss=current_best)
                             print(f"✓ Saved checkpoint -- {os.path.basename(out)}", flush=True)
 
                         if demo_will_fire:
@@ -708,6 +853,19 @@ def run_training(args, backend):
 
                 if raw_step >= max_steps:
                     break
+
+            # --- End of epoch: check for new best checkpoint ---
+            if (best_tracker is not None and checkpoint_dir
+                    and epoch % best_tracker.check_every_n_epochs == 0):
+                best_path = best_tracker.maybe_save_best(
+                    backend=backend, model=model,
+                    saved_lora_cfg=saved_lora_cfg, base_model_name=base_model_name,
+                    global_step=global_step, epoch=epoch,
+                    checkpoint_dir=checkpoint_dir, run_label=run_label,
+                )
+                if best_path:
+                    print(f"  ★ New best (EMA loss={best_tracker.best_so_far:.6f}, "
+                          f"epoch={epoch}) -- {os.path.basename(best_path)}", flush=True)
             epoch += 1
 
         # Final save (skip if the last regular save already covered this
@@ -719,8 +877,23 @@ def run_training(args, backend):
                 and global_step > 0
                 and global_step % save_every != 0):
             out = os.path.join(checkpoint_dir, _ckpt_filename(run_label, global_step, epoch))
-            save_lora_step(backend, model, saved_lora_cfg, out, step=global_step, epoch=epoch, base_model=base_model_name)
+            current_best = best_tracker.best_so_far if best_tracker is not None else None
+            save_lora_step(backend, model, saved_lora_cfg, out, step=global_step, epoch=epoch,
+                            base_model=base_model_name, best_ema_loss=current_best)
             print(f"✓ Saved checkpoint -- {os.path.basename(out)} (final)", flush=True)
+
+            if best_tracker is not None:
+                best_path = best_tracker.maybe_save_best(
+                    backend=backend, model=model,
+                    saved_lora_cfg=saved_lora_cfg, base_model_name=base_model_name,
+                    global_step=global_step, epoch=epoch,
+                    checkpoint_dir=checkpoint_dir, run_label=run_label,
+                )
+                if best_path:
+                    print(f"  ★ New best (EMA loss={best_tracker.best_so_far:.6f}) -- "
+                          f"{os.path.basename(best_path)}", flush=True)
     finally:
         lbt_log.close()
+        if tb_writer is not None:
+            tb_writer.close()
         print("Training done", flush=True)

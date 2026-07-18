@@ -1243,6 +1243,62 @@
       </div>
       <label class="modal-label">LR</label>
       <input type="text" class="resume-input" id="resume-lr" value="" placeholder="default (keep current)" oninput="validateResume()">
+      <details id="resume-advanced" style="margin:8px 0;background:rgba(255,255,255,0.04);border-radius:6px;padding:8px 10px">
+        <summary style="cursor:pointer;font-size:0.8em;color:#9e9e9e;user-select:none">Advanced</summary>
+        <div class="new-ft-grid4" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-top:8px">
+          <div>
+            <label class="modal-label">Warmup steps</label>
+            <input type="number" class="resume-input" id="resume-warmup-steps" value="" min="0" placeholder="default (keep current)" oninput="validateResume()">
+          </div>
+          <div>
+            <label class="modal-label">Weight decay</label>
+            <input type="text" class="resume-input" id="resume-weight-decay" value="" placeholder="default (keep current)" oninput="validateResume()">
+          </div>
+          <div>
+            <label class="modal-label">Timestep sampler</label>
+            <select class="resume-input" id="resume-timestep-sampler">
+              <option value="">default (keep current)</option>
+              <option value="uniform">uniform</option>
+              <option value="logit_normal">logit_normal</option>
+              <option value="trunc_logit_normal">trunc_logit_normal</option>
+              <option value="log_snr">log_snr</option>
+              <option value="log_snr_uniform">log_snr_uniform</option>
+            </select>
+          </div>
+          <div>
+            <label class="modal-label">Loss normalization</label>
+            <select class="resume-input" id="resume-loss-normalization">
+              <option value="">default (keep current)</option>
+              <option value="none">none</option>
+              <option value="timestep">timestep</option>
+              <option value="sample">sample</option>
+              <option value="sample_channel">sample_channel</option>
+            </select>
+          </div>
+        </div>
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">
+          <label class="modal-label">Best checkpoint tracking</label>
+          <select class="resume-input" id="resume-best-ckpt-enabled" onchange="document.getElementById('resume-best-ckpt-row').style.display = this.value === 'true' ? 'grid' : 'none'">
+            <option value="">default (keep current)</option>
+            <option value="true">enabled</option>
+            <option value="false">disabled</option>
+          </select>
+          <div id="resume-best-ckpt-row" style="display:none;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:8px">
+            <div>
+              <label class="modal-label">Best-ckpt warmup steps</label>
+              <input type="number" class="resume-input" id="resume-best-ckpt-warmup" value="" min="0" placeholder="default (keep current)" oninput="validateResume()">
+            </div>
+            <div>
+              <label class="modal-label">Keep last N best</label>
+              <input type="number" class="resume-input" id="resume-best-ckpt-keep-n" value="" min="1" placeholder="default (keep current)" oninput="validateResume()">
+            </div>
+            <div>
+              <label class="modal-label">Check every N epochs</label>
+              <input type="number" class="resume-input" id="resume-best-ckpt-check-every-n" value="" min="1" placeholder="default (keep current)" oninput="validateResume()">
+            </div>
+          </div>
+        </div>
+      </details>
       <div class="resume-error" id="resume-error"></div>
       <div class="modal-actions" style="margin-top:16px">
         <button class="modal-cancel" onclick="closeResumeModal()">Cancel</button>
@@ -1389,6 +1445,60 @@
           <input type="number" class="resume-input" id="new-ft-demo-every" value="1000" oninput="validateNewFt()">
         </div>
       </div>
+      <details id="new-ft-advanced" style="margin:8px 0;background:rgba(255,255,255,0.04);border-radius:6px;padding:8px 10px">
+        <summary style="cursor:pointer;font-size:0.8em;color:#9e9e9e;user-select:none">Advanced</summary>
+        <div class="new-ft-grid4" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-top:8px">
+          <div>
+            <label class="modal-label">Warmup steps</label>
+            <input type="number" class="resume-input" id="new-ft-warmup-steps" value="0" min="0" placeholder="0" oninput="validateNewFt()">
+          </div>
+          <div>
+            <label class="modal-label">Weight decay</label>
+            <input type="text" class="resume-input" id="new-ft-weight-decay" value="" placeholder="0.01 (default)" oninput="validateNewFt()">
+          </div>
+          <div>
+            <label class="modal-label">Timestep sampler</label>
+            <select class="resume-input" id="new-ft-timestep-sampler">
+              <option value="">default (uniform)</option>
+              <option value="uniform">uniform</option>
+              <option value="logit_normal">logit_normal</option>
+              <option value="trunc_logit_normal">trunc_logit_normal</option>
+              <option value="log_snr">log_snr</option>
+              <option value="log_snr_uniform">log_snr_uniform</option>
+            </select>
+          </div>
+          <div>
+            <label class="modal-label">Loss normalization</label>
+            <select class="resume-input" id="new-ft-loss-normalization">
+              <option value="">default (none)</option>
+              <option value="none">none</option>
+              <option value="timestep">timestep</option>
+              <option value="sample">sample</option>
+              <option value="sample_channel">sample_channel</option>
+            </select>
+          </div>
+        </div>
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">
+          <label style="display:flex;align-items:center;gap:6px;font-size:0.85em;cursor:pointer">
+            <input type="checkbox" id="new-ft-best-ckpt-enabled" onchange="document.getElementById('new-ft-best-ckpt-row').style.display = this.checked ? 'grid' : 'none'">
+            Save best checkpoint (by EMA-smoothed training loss)
+          </label>
+          <div id="new-ft-best-ckpt-row" style="display:none;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
+            <div>
+              <label class="modal-label">Best-ckpt warmup steps</label>
+              <input type="number" class="resume-input" id="new-ft-best-ckpt-warmup" value="1000" min="0" oninput="validateNewFt()">
+            </div>
+            <div>
+              <label class="modal-label">Keep last N best</label>
+              <input type="number" class="resume-input" id="new-ft-best-ckpt-keep-n" value="5" min="1" oninput="validateNewFt()">
+            </div>
+            <div>
+              <label class="modal-label">Check every N epochs</label>
+              <input type="number" class="resume-input" id="new-ft-best-ckpt-check-every-n" value="10" min="1" title="10 is good for small datasets (~13 samples). Larger datasets can use 1." oninput="validateNewFt()">
+            </div>
+          </div>
+        </div>
+      </details>
       <div class="modal-actions" style="margin-top:16px;display:flex;align-items:center">
         <div id="new-ft-ckpt-estimate" style="color:var(--yellow);flex:1;font-size:0.85em"></div>
         <button class="modal-cancel" onclick="closeNewFinetuneModal()">Cancel</button>
@@ -4698,6 +4808,12 @@ window.validateResume = function() {
   } else if (lrStr && isNaN(Number(lrStr))) {
     err.textContent = 'LR must be a number (e.g. 1e-4)';
     btn.disabled = true;
+  } else if ((() => { const s = document.getElementById('resume-weight-decay').value.trim(); return s && (isNaN(Number(s)) || Number(s) < 0); })()) {
+    err.textContent = 'Weight decay must be a non-negative number';
+    btn.disabled = true;
+  } else if ((() => { const s = document.getElementById('resume-warmup-steps').value.trim(); return s && (isNaN(parseInt(s, 10)) || parseInt(s, 10) < 0); })()) {
+    err.textContent = 'Warmup steps must be a non-negative integer';
+    btn.disabled = true;
   } else {
     err.textContent = '';
     btn.disabled = false;
@@ -4725,6 +4841,22 @@ window.confirmResume = async function() {
   const payload = {max_steps: val, gpu: _resumeSelectedGpu, batch_size: batch, checkpoint_every: ckptEvery, demo_every: demoEvery};
   if (ckptPath) payload.checkpoint_path = ckptPath;
   if (lrStr) payload.lr = lrStr;
+  const weightDecayStr = document.getElementById('resume-weight-decay').value.trim();
+  if (weightDecayStr) payload.weight_decay = Number(weightDecayStr);
+  const warmupStepsStr = document.getElementById('resume-warmup-steps').value.trim();
+  if (warmupStepsStr) payload.warmup_steps = parseInt(warmupStepsStr, 10);
+  const timestepSampler = document.getElementById('resume-timestep-sampler').value;
+  if (timestepSampler) payload.timestep_sampler = timestepSampler;
+  const lossNormalization = document.getElementById('resume-loss-normalization').value;
+  if (lossNormalization) payload.loss_normalization = lossNormalization;
+  const bcEnabledStr = document.getElementById('resume-best-ckpt-enabled').value;
+  if (bcEnabledStr) payload.best_checkpoint_enabled = bcEnabledStr === 'true';
+  const bcWarmup = document.getElementById('resume-best-ckpt-warmup').value.trim();
+  if (bcWarmup) payload.best_checkpoint_warmup_steps = parseInt(bcWarmup, 10);
+  const bcKeepN = document.getElementById('resume-best-ckpt-keep-n').value.trim();
+  if (bcKeepN) payload.best_checkpoint_keep_n = parseInt(bcKeepN, 10);
+  const bcCheckEvery = document.getElementById('resume-best-ckpt-check-every-n').value.trim();
+  if (bcCheckEvery) payload.best_checkpoint_check_every_n_epochs = parseInt(bcCheckEvery, 10);
   if (!isNaN(cropLen) && cropLen > 0) payload.latent_crop_length = cropLen;
   payload.random_crop = cropMode === 'random';
   try {
@@ -6338,6 +6470,8 @@ window.validateNewFt = function() {
   const ckptEvery = parseInt(document.getElementById('new-ft-ckpt-every').value, 10);
   const demoEvery = parseInt(document.getElementById('new-ft-demo-every').value, 10);
   const lrStr = document.getElementById('new-ft-lr').value.trim();
+  const weightDecayStr = document.getElementById('new-ft-weight-decay').value.trim();
+  const warmupStepsStr = document.getElementById('new-ft-warmup-steps').value.trim();
   const el = document.getElementById('new-ft-ckpt-estimate');
   const btn = document.getElementById('new-ft-next-btn');
   const baseModelKey = document.getElementById('new-ft-base-model').value;
@@ -6366,6 +6500,8 @@ window.validateNewFt = function() {
   else if (isNaN(ckptEvery) || ckptEvery < 1) error = 'Ckpt every must be >= 1';
   else if (isNaN(demoEvery) || demoEvery < 1) error = 'Demo every must be >= 1';
   else if (lrStr && isNaN(Number(lrStr))) error = 'LR must be a number (e.g. 1e-4)';
+  else if (weightDecayStr && (isNaN(Number(weightDecayStr)) || Number(weightDecayStr) < 0)) error = 'Weight decay must be a non-negative number';
+  else if (warmupStepsStr && (isNaN(parseInt(warmupStepsStr, 10)) || parseInt(warmupStepsStr, 10) < 0)) error = 'Warmup steps must be a non-negative integer';
   else {
     const cropLen = parseInt(document.getElementById('new-ft-crop-length').value, 10);
     if (isNaN(cropLen) || cropLen < 1) error = 'Latent seq length must be >= 1';
@@ -6412,6 +6548,23 @@ window.confirmNewFinetune = async function() {
   if (includeStr) payload.lora_include = includeStr;
   if (excludeStr) payload.lora_exclude = excludeStr;
   if (lrStr) payload.lr = lrStr;
+  const weightDecayStr = document.getElementById('new-ft-weight-decay').value.trim();
+  if (weightDecayStr) payload.weight_decay = Number(weightDecayStr);
+  const warmupStepsStr = document.getElementById('new-ft-warmup-steps').value.trim();
+  if (warmupStepsStr && parseInt(warmupStepsStr, 10) > 0) payload.warmup_steps = parseInt(warmupStepsStr, 10);
+  const timestepSampler = document.getElementById('new-ft-timestep-sampler').value;
+  if (timestepSampler) payload.timestep_sampler = timestepSampler;
+  const lossNormalization = document.getElementById('new-ft-loss-normalization').value;
+  if (lossNormalization) payload.loss_normalization = lossNormalization;
+  payload.best_checkpoint_enabled = document.getElementById('new-ft-best-ckpt-enabled').checked;
+  if (payload.best_checkpoint_enabled) {
+    const bcWarmup = document.getElementById('new-ft-best-ckpt-warmup').value.trim();
+    if (bcWarmup) payload.best_checkpoint_warmup_steps = parseInt(bcWarmup, 10);
+    const bcKeepN = document.getElementById('new-ft-best-ckpt-keep-n').value.trim();
+    if (bcKeepN) payload.best_checkpoint_keep_n = parseInt(bcKeepN, 10);
+    const bcCheckEvery = document.getElementById('new-ft-best-ckpt-check-every-n').value.trim();
+    if (bcCheckEvery) payload.best_checkpoint_check_every_n_epochs = parseInt(bcCheckEvery, 10);
+  }
   const basePrecision = document.getElementById('new-ft-base-precision').value;
   if (basePrecision) payload.base_precision = basePrecision;
   if (datasetId) payload.dataset_id = datasetId;

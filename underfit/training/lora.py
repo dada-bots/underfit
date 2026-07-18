@@ -88,7 +88,7 @@ def apply_lora_from_config(backend, model, lora_config, lora_state_dict=None,
 
 
 def save_lora_step(backend, model, lora_save_config, out_path,
-                   *, step=None, epoch=None, base_model=None):
+                   *, step=None, epoch=None, base_model=None, best_ema_loss=None):
     """Save LoRA weights to out_path as a .safetensors file with config metadata.
 
     `step` and `epoch` are folded into the saved metadata (under the "step"
@@ -98,6 +98,12 @@ def save_lora_step(backend, model, lora_save_config, out_path,
     `base_model` (e.g. "sa3-medium") goes into metadata too — used by the
     dashboard's "Start from a previous LoRA" upload flow to verify the seed
     is shape-compatible with the user's selected base model.
+
+    `best_ema_loss`, if given, is the best EMA-smoothed training loss seen
+    so far in this run (across any prior resumes) — stamped into every
+    checkpoint (not just the literal best one) so a future resume from
+    *any* checkpoint can recover "best so far as of that point" without a
+    separate sidecar file. See _BestCheckpointTracker in loop.py.
     """
     lora_mod = backend.lora_module()
     state_dict = {
@@ -111,6 +117,8 @@ def save_lora_step(backend, model, lora_save_config, out_path,
         enriched_cfg["epoch"] = int(epoch)
     if base_model:
         enriched_cfg["base_model"] = str(base_model)
+    if best_ema_loss is not None:
+        enriched_cfg["best_ema_loss"] = float(best_ema_loss)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     lora_mod.save_lora_safetensors(state_dict, enriched_cfg, out_path)
 

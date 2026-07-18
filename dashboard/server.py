@@ -86,6 +86,102 @@ def _atomic_write_json(path, data):
         f.flush()
         os.fsync(f.fileno())
     os.replace(str(tmp), str(path))
+
+
+# Valid values for the two enum-like advanced overrides — kept here so both
+# the New Finetune and Resume handlers validate identically.
+_VALID_TIMESTEP_SAMPLERS = {
+    "uniform", "logit_normal", "trunc_logit_normal", "log_snr", "log_snr_uniform",
+}
+_VALID_LOSS_NORMALIZATIONS = {"none", "timestep", "sample", "sample_channel"}
+
+
+def _warmup_base_for_steps(warmup_steps, target=0.99):
+    """Convert an intuitive "warmup steps" count into the `warmup` base
+    InverseLR actually takes (a (0,1) exponential-decay base, NOT a step
+    count — see underfit/training/optim.py). Returns the base such that the
+    warmup ramp reaches `target` fraction of full LR by `warmup_steps`.
+
+    warmup factor at step n is (1 - base**(n+1)); solving for base when
+    n = warmup_steps and factor = target gives the formula below.
+    """
+    if not warmup_steps or warmup_steps <= 0:
+        return 0.0
+    return (1 - target) ** (1.0 / (warmup_steps + 1))
+
+
+def _apply_advanced_training_overrides(cfg, body):
+    """Apply the four 'advanced' training overrides (warmup steps, timestep
+    sampler, loss normalization, weight decay) from a New Finetune / Resume
+    request body onto a run's training config dict, in place.
+
+    Mirrors the existing `lr` override pattern used by both handlers: only
+    touches a field if the request actually supplied it, so omitting a field
+    leaves whatever was already in `cfg` (e.g. restored from a previous
+    run's config on resume) untouched.
+    """
+    training_cfg = cfg.setdefault("training", {})
+
+    warmup_steps = body.get("warmup_steps")
+    if warmup_steps not in (None, ""):
+        warmup_steps = int(warmup_steps)
+        opt_cfg = (training_cfg.setdefault("optimizer_configs", {})
+                   .setdefault("diffusion", {}))
+        if warmup_steps > 0:
+            # inv_gamma huge + power=1 => negligible post-warmup decay, so
+            # this only adds the warmup ramp without changing the flat-LR
+            # behavior runs already have today (see _warmup_base_for_steps).
+            opt_cfg["scheduler"] = {
+                "type": "InverseLR",
+                "config": {
+                    "warmup": _warmup_base_for_steps(warmup_steps),
+                    "inv_gamma": 1e9,
+                    "power": 1.0,
+                },
+            }
+        else:
+            opt_cfg.pop("scheduler", None)
+
+    weight_decay = body.get("weight_decay")
+    if weight_decay not in (None, ""):
+        (training_cfg.setdefault("optimizer_configs", {})
+         .setdefault("diffusion", {}).setdefault("optimizer", {})
+         .setdefault("config", {}))["weight_decay"] = float(weight_decay)
+
+    # Best-checkpoint tracking: saves a copy of the regular checkpoint as
+    # "best" whenever an EMA of the training loss hits a new low (after an
+    # optional warmup), keeping only the most recent N best files. See
+    # _BestCheckpointTracker in underfit/training/loop.py. Off by default —
+    # only touched if the request explicitly includes the enabled flag
+    # (checkbox semantics: always present as true/false, never blank).
+    if "best_checkpoint_enabled" in body:
+        training_cfg["best_checkpoint_enabled"] = bool(body["best_checkpoint_enabled"])
+
+    best_ckpt_warmup = body.get("best_checkpoint_warmup_steps")
+    if best_ckpt_warmup not in (None, ""):
+        training_cfg["best_checkpoint_warmup_steps"] = int(best_ckpt_warmup)
+
+    best_ckpt_keep_n = body.get("best_checkpoint_keep_n")
+    if best_ckpt_keep_n not in (None, ""):
+        training_cfg["best_checkpoint_keep_n"] = int(best_ckpt_keep_n)
+
+    best_ckpt_check_every_n = body.get("best_checkpoint_check_every_n_epochs")
+    if best_ckpt_check_every_n not in (None, ""):
+        training_cfg["best_checkpoint_check_every_n_epochs"] = int(best_ckpt_check_every_n)
+
+    timestep_sampler = body.get("timestep_sampler")
+    if timestep_sampler:
+        if timestep_sampler not in _VALID_TIMESTEP_SAMPLERS:
+            raise ValueError(f"invalid timestep_sampler: {timestep_sampler!r}")
+        training_cfg["timestep_sampler"] = timestep_sampler
+
+    loss_normalization = body.get("loss_normalization")
+    if loss_normalization:
+        if loss_normalization not in _VALID_LOSS_NORMALIZATIONS:
+            raise ValueError(f"invalid loss_normalization: {loss_normalization!r}")
+        training_cfg["loss_normalization"] = loss_normalization
+
+
 AUDIO_DIR = STATE_DIR / "audio"                 # generated demo MP3s + spectrogram JPGs
 
 # Base-model files (SA3 RF + ARC, T5Gemma) — defaults to STATE_DIR/models,
@@ -4140,6 +4236,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if lr_raw:
                 lr_val = float(lr_raw)
                 cfg["training"].setdefault("optimizer_configs", {}).setdefault("diffusion", {}).setdefault("optimizer", {}).setdefault("config", {})["lr"] = lr_val
+            _apply_advanced_training_overrides(cfg, body)
             # Inject ARC path for demos during training.
             if mi.get("arc_ckpt"):
                 demo_config = cfg["training"].setdefault("demo", {})
@@ -4482,6 +4579,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if lr_raw:
                 lr_val = float(lr_raw)
                 cfg.setdefault("training", {}).setdefault("optimizer_configs", {}).setdefault("diffusion", {}).setdefault("optimizer", {}).setdefault("config", {})["lr"] = lr_val
+            _apply_advanced_training_overrides(cfg, body)
             # Assign fresh random seeds 10-100 to each demo on resume
             import random as _rng
             for entry in cfg.get("training", {}).get("demo", {}).get("demo_cond", []):

@@ -3182,19 +3182,22 @@ def _process_run_demos(run):
         except Exception:
             pass
 
-    # Copy individual demo files (demo_{i}_{step}.mp3 + .json sidecars)
+    # Copy individual demo files (demo_{i}_{step}.{mp3,wav} + .json sidecars).
+    # WAV is the fallback the MLX trainer writes when ffmpeg is unavailable.
     spec_futs = []
-    for src in sorted(demo_source.glob("demo_*_*.mp3")):
+    demo_srcs = sorted(list(demo_source.glob("demo_*_*.mp3"))
+                       + list(demo_source.glob("demo_*_*.wav")))
+    for src in demo_srcs:
         if run_created_ts and src.stat().st_mtime < run_created_ts:
             continue  # Pre-dates this run
-        m = re.match(r"demo_(\d+)_(\d+)\.mp3", src.name)
+        m = re.match(r"demo_(\d+)_(\d+)\.(?:mp3|wav)", src.name)
         if not m:
             continue
         idx = int(m.group(1))
         step = int(m.group(2))
         step_dir = out_base / f"step_{step:08d}"
         step_dir.mkdir(parents=True, exist_ok=True)
-        dest = step_dir / f"demo_{idx}.mp3"
+        dest = step_dir / f"demo_{idx}{src.suffix}"
         src_size = src.stat().st_size
         dest_size = dest.stat().st_size if dest.exists() else 0
         if dest_size == 0 or dest_size != src_size:
@@ -3208,17 +3211,18 @@ def _process_run_demos(run):
         json_dest = step_dir / f"demo_{idx}.json"
         if json_src.exists() and not json_dest.exists():
             shutil.copy2(json_src, json_dest)
-    # Named extra demos (e.g. demo_arc_00001000.mp3)
-    for src in sorted(demo_source.glob("demo_arc_*.mp3")):
+    # Named extra demos (e.g. demo_arc_00001000.mp3 / .wav)
+    for src in sorted(list(demo_source.glob("demo_arc_*.mp3"))
+                      + list(demo_source.glob("demo_arc_*.wav"))):
         if run_created_ts and src.stat().st_mtime < run_created_ts:
             continue
-        m = re.match(r"demo_arc_(\d+)\.mp3", src.name)
+        m = re.match(r"demo_arc_(\d+)\.(?:mp3|wav)", src.name)
         if not m:
             continue
         step = int(m.group(1))
         step_dir = out_base / f"step_{step:08d}"
         step_dir.mkdir(parents=True, exist_ok=True)
-        dest = step_dir / "demo_arc.mp3"
+        dest = step_dir / f"demo_arc{src.suffix}"
         if not dest.exists() or dest.stat().st_size == 0:
             shutil.copy2(src, dest)
         jpg_dest = step_dir / "demo_arc.jpg"
@@ -4284,11 +4288,20 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         out = gt_dir / f"track_{i}.mp3"
                         title = gte.get("title", "")
                         gt_prompt = gte.get("gt_prompt", title)
-                        subprocess.run(
-                            ["ffmpeg", "-y", "-i", src, "-map", "0:a",
-                             "-codec:a", "libmp3lame", "-q:a", "2",
-                             "-loglevel", "error", str(out)],
-                            capture_output=True, timeout=600)
+                        try:
+                            subprocess.run(
+                                ["ffmpeg", "-y", "-i", src, "-map", "0:a",
+                                 "-codec:a", "libmp3lame", "-q:a", "2",
+                                 "-loglevel", "error", str(out)],
+                                capture_output=True, timeout=600)
+                        except FileNotFoundError:
+                            # ffmpeg not installed — skip GT preview (cosmetic only).
+                            print("[gt] ffmpeg not found — skipping ground-truth preview "
+                                  "(install ffmpeg: brew install ffmpeg)")
+                            continue
+                        except Exception as e:
+                            print(f"[gt] Failed to convert {src}: {e}")
+                            continue
                         # Drop the entry if ffmpeg silently failed to write
                         if not out.exists() or out.stat().st_size == 0:
                             continue
@@ -7646,20 +7659,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if not step_dir.is_dir():
                 continue
             clips = []
-            for mp3 in sorted(step_dir.glob("demo_*.mp3")):
-                dm = re.match(r"demo_(\d+)\.mp3", mp3.name)
+            # mp3 (ffmpeg) or wav (fallback when ffmpeg is unavailable).
+            for clip_src in sorted(list(step_dir.glob("demo_*.mp3"))
+                                   + list(step_dir.glob("demo_*.wav"))):
+                dm = re.match(r"demo_(\d+)\.(?:mp3|wav)", clip_src.name)
                 if dm:
                     clip = {
                         "index": int(dm.group(1)),
-                        "url": f"/audio/runs/{run_id}/{step_dir.name}/{mp3.name}",
-                        "size_mb": round(mp3.stat().st_size / 1e6, 1),
+                        "url": f"/audio/runs/{run_id}/{step_dir.name}/{clip_src.name}",
+                        "size_mb": round(clip_src.stat().st_size / 1e6, 1),
                     }
                     # Add spectrogram URL if JPG exists
-                    jpg_path = mp3.with_suffix(".jpg")
+                    jpg_path = clip_src.with_suffix(".jpg")
                     if jpg_path.exists():
                         clip["spectrogram_url"] = f"/audio/runs/{run_id}/{step_dir.name}/{jpg_path.name}"
                     # Read JSON sidecar for per-clip metadata
-                    json_path = mp3.with_suffix(".json")
+                    json_path = clip_src.with_suffix(".json")
                     if json_path.exists():
                         try:
                             with open(json_path) as jf:
@@ -7667,12 +7682,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         except Exception:
                             pass
                     clips.append(clip)
-            # ARC demo clip
+            # ARC demo clip (mp3, or wav fallback)
             arc_path = step_dir / "demo_arc.mp3"
+            if not arc_path.exists():
+                arc_path = step_dir / "demo_arc.wav"
             if arc_path.exists():
                 arc_clip = {
                     "index": "arc",
-                    "url": f"/audio/runs/{run_id}/{step_dir.name}/demo_arc.mp3",
+                    "url": f"/audio/runs/{run_id}/{step_dir.name}/{arc_path.name}",
                     "size_mb": round(arc_path.stat().st_size / 1e6, 1),
                 }
                 arc_jpg = step_dir / "demo_arc.jpg"

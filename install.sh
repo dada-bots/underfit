@@ -72,6 +72,19 @@ say "syncing dependencies (uv sync --inexact) …"
 # the wizard is re-run. --inexact skips that prune.
 uv sync --inexact
 
+# ── 2b. ffmpeg (optional but recommended) ───────────────────────────────────
+# The dashboard uses ffmpeg for ground-truth preview clips + clip downloads,
+# and the trainers (torch + MLX demos) use it to write MP3 demos. Missing
+# ffmpeg is NOT fatal — GT previews are skipped and demos fall back to WAV —
+# but MP3 is smaller and previews are nicer, so recommend installing it.
+if command -v ffmpeg >/dev/null 2>&1; then
+    say "ffmpeg found ($(command -v ffmpeg)) — MP3 demos + audio previews enabled"
+else
+    say "ffmpeg NOT found (optional): dashboard previews are skipped and training"
+    say "  demos fall back to WAV. To enable MP3 (fast, prebuilt on Apple Silicon):"
+    printf '    \033[1mbrew install ffmpeg\033[0m\n'
+fi
+
 # ── 3. wizard ──────────────────────────────────────────────────────────────
 if [ "$SKIP_SETUP" -eq 1 ]; then
     say "skipping underfit-setup (--no-setup passed)"

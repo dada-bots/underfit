@@ -3006,6 +3006,14 @@ SPEC_BANDS = [
 SPEC_W, SPEC_H = 300, 60
 _spec_pool = ThreadPoolExecutor(max_workers=4)
 
+# libsndfile 1.2.2's MPEG decoder reports errors by longjmp-ing through a
+# process-global jmpbuf (libmpg123). Two threads decoding mp3s at once race on
+# it: one clobbers the other's saved context, the longjmp lands on a dead stack
+# frame, and the process takes SIGBUS (pc=0x1, EXC_ARM_DA_ALIGN) inside
+# mpeg_init. We fan out decodes from _spec_pool, a 16-worker pool, and the
+# threaded HTTP server, so serialize every sf.read behind this lock.
+_sndfile_lock = threading.Lock()
+
 # Pre-compute band colors as (3, 3) array for vectorized multiply
 _BAND_COLORS = np.array([c for _, _, c in SPEC_BANDS], dtype=np.float32)
 
@@ -3067,7 +3075,8 @@ def _power_to_db(S, top_db=80.0):
 
 def _load_audio(path, target_sr=32000):
     """Load + resample to target_sr. Returns (channels, samples) like librosa(mono=False)."""
-    y, sr = sf.read(str(path), dtype='float32', always_2d=False)
+    with _sndfile_lock:  # see _sndfile_lock: concurrent mp3 decode is a SIGBUS
+        y, sr = sf.read(str(path), dtype='float32', always_2d=False)
     if y.ndim == 2:
         y = y.T  # soundfile gives (n, c); we want (c, n)
     if sr != target_sr:

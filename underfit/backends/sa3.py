@@ -280,7 +280,7 @@ def create_dataloader(dataset_config, batch_size, sample_size, sample_rate,
     if dataset_type == "pre_encoded":
         configs = []
         for ds in dataset_config["datasets"]:
-            cmf = _load_custom_metadata_fn(ds.get("custom_metadata_module"))
+            cmf = _load_custom_metadata_fn(ds.get("custom_metadata_module"), dataset_config=dataset_config)
             configs.append(LatentDatasetConfig(
                 id=ds["id"],
                 path=_resolve_app_relative_path(ds["path"]),
@@ -301,7 +301,7 @@ def create_dataloader(dataset_config, batch_size, sample_size, sample_rate,
         force_channels = "mono" if audio_channels == 1 else "stereo"
         configs = []
         for ds in dataset_config["datasets"]:
-            cmf = _load_custom_metadata_fn(ds.get("custom_metadata_module"))
+            cmf = _load_custom_metadata_fn(ds.get("custom_metadata_module"), dataset_config=dataset_config)
             configs.append(LocalDatasetConfig(
                 id=ds["id"],
                 path=_resolve_app_relative_path(ds["path"]),
@@ -320,6 +320,7 @@ def create_dataloader(dataset_config, batch_size, sample_size, sample_rate,
             volume_norm_param=dataset_config.get("volume_norm_param", (-16, 2)),
             strip_silence=dataset_config.get("strip_silence", False),
             pad=pad,
+            seconds_resolution=dataset_config.get("seconds_resolution", 1.0),
         )
     else:
         raise NotImplementedError(
@@ -373,7 +374,7 @@ def create_dataloader(dataset_config, batch_size, sample_size, sample_rate,
     )
 
 
-def _load_custom_metadata_fn(module_path):
+def _load_custom_metadata_fn(module_path, dataset_config=None):
     if module_path is None:
         return None
     module_path = _resolve_app_relative_path(module_path)
@@ -381,6 +382,8 @@ def _load_custom_metadata_fn(module_path):
     spec = importlib.util.spec_from_file_location("metadata_module", module_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    if dataset_config is not None and hasattr(mod, "set_config"):
+        mod.set_config(dataset_config)
     return mod.get_custom_metadata
 
 

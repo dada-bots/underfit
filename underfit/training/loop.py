@@ -278,6 +278,12 @@ def run_training(args, backend):
     # Dashboard writes this so saved checkpoints record which base model they
     # came from. Used by the seed-LoRA upload flow to verify compatibility.
     base_model_name = model_config.get("base_model")
+    # What the baked dora row norms are taken against. Prefer the dashboard's label,
+    # but fall back to the checkpoint actually streamed in below -- no config the
+    # dashboard writes today sets "base_model", so relying on it alone would leave
+    # every checkpoint's norms unattributed.
+    norm_base_name = base_model_name or (
+        os.path.basename(args.pretrained_ckpt_path) if args.pretrained_ckpt_path else None)
     if lora_config:
         print("LoRA config:", lora_config)
 
@@ -693,7 +699,8 @@ def run_training(args, backend):
                             if manual_save_requested[0]:
                                 manual_save_requested[0] = False
                             out = os.path.join(checkpoint_dir, _ckpt_filename(run_label, global_step, epoch))
-                            save_lora_step(backend, model, saved_lora_cfg, out, step=global_step, epoch=epoch, base_model=base_model_name)
+                            save_lora_step(backend, model, saved_lora_cfg, out, step=global_step, epoch=epoch,
+                                           base_model=base_model_name, norm_base=norm_base_name)
                             print(f"✓ Saved checkpoint -- {os.path.basename(out)}", flush=True)
 
                         if demo_will_fire:
@@ -728,7 +735,8 @@ def run_training(args, backend):
                 and global_step > 0
                 and global_step % save_every != 0):
             out = os.path.join(checkpoint_dir, _ckpt_filename(run_label, global_step, epoch))
-            save_lora_step(backend, model, saved_lora_cfg, out, step=global_step, epoch=epoch, base_model=base_model_name)
+            save_lora_step(backend, model, saved_lora_cfg, out, step=global_step, epoch=epoch,
+                                           base_model=base_model_name, norm_base=norm_base_name)
             print(f"✓ Saved checkpoint -- {os.path.basename(out)} (final)", flush=True)
     finally:
         lbt_log.close()

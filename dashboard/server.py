@@ -506,6 +506,25 @@ GRADIO_PORT_BASE = 7860
 GRADIO_LOG_DIR = STATE_DIR / "gradio_logs"
 GRADIO_LOG_DIR.mkdir(exist_ok=True)
 
+def _user_path(raw):
+    """Resolve a user-pasted/dropped directory string to an absolute Path.
+
+    Tolerates what Finder/Terminal drags produce: `file://` URIs with
+    %-escapes, surrounding quotes, and shell backslash-escaped spaces.
+    """
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        s = s[1:-1]
+    if s.lower().startswith("file:"):
+        parsed = urlparse(s)
+        s = unquote(parsed.path)
+        if parsed.netloc and parsed.netloc != "localhost":
+            s = f"//{parsed.netloc}{s}"
+    elif "\\" in s and not Path(s).expanduser().exists():
+        s = re.sub(r"\\(.)", r"\1", s)
+    return Path(s).expanduser().resolve()
+
+
 def _slugify(name):
     """Sanitize a name to a lowercase slug [a-z0-9._-]."""
     s = name.lower().strip()
@@ -5938,7 +5957,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         Returns (file_info_list, total_files, files_with_tags,
         files_with_json, csv_count).
         """
-        p = Path(dir_path).expanduser().resolve()
+        p = _user_path(dir_path)
         audio_files = []
         # Collect ALL .json files for cross-directory sidecar matching
         json_files = {}  # stem -> list of absolute Paths
@@ -6337,7 +6356,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not dir_path:
             self._json_response({"error": "path is required"}, status=400)
             return
-        p = Path(dir_path).expanduser().resolve()
+        p = _user_path(dir_path)
         if not p.is_dir():
             self._json_response({"error": f"Not a directory: {p}"}, status=400)
             return
@@ -6442,7 +6461,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._json_response({"error": f"unknown model: {model}"}, status=400)
             return
 
-        src = Path(src_path).expanduser().resolve()
+        src = _user_path(src_path)
         if not src.is_dir():
             self._json_response({"error": f"Not a directory: {src}"}, status=400)
             return
@@ -6603,7 +6622,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not gpus or not isinstance(gpus, list):
             self._json_response({"error": "gpus array required"}, status=400)
             return
-        input_path = Path(input_dir).expanduser().resolve()
+        input_path = _user_path(input_dir)
         if not input_path.is_dir():
             self._json_response({"error": f"Not a directory: {input_path}"}, status=400)
             return

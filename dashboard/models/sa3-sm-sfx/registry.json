@@ -21,7 +21,7 @@
     "arc_ckpt": "{models_dir}/sa3-sm-sfx/arc/model.safetensors"
   },
   "hf_repo": {
-    "arc":  "stabilityai/stable-audio-3-small-sfx",
+    "arc": "stabilityai/stable-audio-3-small-sfx",
     "base": "stabilityai/stable-audio-3-small-sfx-base"
   },
   "arc": {
@@ -90,6 +90,10 @@
         {
           "label": "global_cond_embedder",
           "pattern": "global_cond_embedder"
+        },
+        {
+          "label": "seconds_total",
+          "pattern": "seconds_total"
         }
       ],
       "other_modules": [

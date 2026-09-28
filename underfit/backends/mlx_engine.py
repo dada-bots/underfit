@@ -16,6 +16,8 @@ Environment overrides:
   UNDERFIT_MLX_PYTHON        MLX venv python (default <mlx_root>/.venv/bin/python)
   UNDERFIT_MLX_BASE_WEIGHTS  base DiT weights npz (default
                              <mlx_root>/models/mlx/dit_<model>-base_f16.npz)
+  UNDERFIT_SPECTROGRAM_MODULE  set for the trainer (default underfit/spectrogram.py)
+                             so it renders demo spectrograms itself
 """
 import json
 import os
@@ -590,6 +592,11 @@ def run_mlx_training(args):
 
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
+    # Let the trainer draw each demo's spectrogram from audio in memory (as the
+    # torch loop does) so the dashboard never decodes the mp3. Loaded by path:
+    # the MLX venv has neither underfit nor torch, and the renderer needs neither.
+    env.setdefault("UNDERFIT_SPECTROGRAM_MODULE",
+                   str(_HERE.parent.parent / "spectrogram.py"))
     # Inherit stdout/stderr: the trainer's tqdm writes straight to the run log
     # (via lora_train.py's redirected fd), preserving \r so the dashboard
     # collapses the progress bar and parses every step's postfix metrics.

@@ -97,7 +97,7 @@ def _last_activity(log_lines):
         if m:
             return {"phase": "training", "step": int(m.group(1)),
                     "text": f"training at step {m.group(1)} (epoch {m.group(2)})"}
-        if "ARC model" in ln and "LoRA merged" in ln:
+        if "ARC model" in ln and ("LoRA merged" in ln or " ready" in ln):
             return {"phase": "demo", "text": "preparing ARC demos (ARC model loaded)"}
         if ln.startswith("loading ARC model"):
             return {"phase": "arc_load",

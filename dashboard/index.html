@@ -1307,13 +1307,20 @@
         <span id="new-ft-no-datasets" style="display:none;color:var(--red);font-size:0.85em;font-weight:600;white-space:nowrap;align-self:center">! No Datasets</span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:8px;align-items:end">
-        <div>
-          <label class="modal-label">Latent seq length</label>
-          <input type="number" class="resume-input" id="new-ft-crop-length" min="1" step="1" pattern="[0-9]*" value="3072" oninput="_updateCropSeconds();updateCkptEstimate();validateNewFt()">
-        </div>
-        <div>
-          <label class="modal-label">Duration</label>
-          <input class="resume-input" id="new-ft-crop-seconds" readonly style="cursor:default;color:var(--text2);background:transparent;border:none" value="285s">
+        <div style="grid-column:span 2;display:flex;gap:10px;align-items:flex-end">
+          <div style="flex:1;min-width:0">
+            <label class="modal-label">Latent seq length</label>
+            <!-- Hidden state read by launch/clone/validate; the slider and Seq box drive it. -->
+            <input type="hidden" id="new-ft-crop-length" value="3072">
+            <div style="display:flex;align-items:center;gap:8px;min-height:32px">
+              <input type="range" id="new-ft-crop-slider" min="0" max="1000" step="1" value="1000" style="flex:1;min-width:80px;accent-color:var(--accent2)">
+              <span id="new-ft-crop-label" style="font-size:0.8em;white-space:nowrap;min-width:80px;text-align:right;color:var(--text2)"></span>
+            </div>
+          </div>
+          <div style="width:72px">
+            <label class="modal-label">Seq</label>
+            <input type="text" class="resume-input" id="new-ft-crop-seq" inputmode="numeric" pattern="[0-9]*" autocomplete="off" style="width:100%;box-sizing:border-box">
+          </div>
         </div>
         <div>
           <label class="modal-label">Crop mode</label>
@@ -3840,8 +3847,11 @@ function _applyEngineOptions() {
 function _applyGpu(data) {
   try {
     const gpus = data.gpus || [];
+    const _prevPlatform = _platform;
     _platform = data.platform || 'cuda';
     _engines = data.engines || ['torch'];
+    if (_platform !== _prevPlatform && !_cropUserEdited
+        && typeof _updateCropLength === 'function') _updateCropLength();
     window._platform = _platform;
     window._engines = _engines;
     _applyEngineOptions();
@@ -4858,11 +4868,65 @@ function _demoEmptyIdx(preset) {
 // native (full) length as a long-form reference (preset 8 only); the rest use
 // the training crop length. RF+ARC → idx 0 (RF) + 4 (ARC); ARC-only (MLX) → the
 // first ARC is idx 0.
-function _defaultDemoDurationLatents(idx, cropLen, nativeLen) {
+// Apple Silicon: the long-form reference defaults to 90 s instead (capped at the
+// model max). A full-length medium demo (4096 latents, ~380 s) takes minutes
+// per demo round on an Apple GPU and can exhaust unified memory; the length
+// slider still reaches the model max.
+const _MAC_LONG_DEMO_SECONDS = 90;
+function _defaultDemoDurationLatents(idx, cropLen, nativeLen, seqInfo) {
   if (_newFtPreset !== 8) return cropLen;
   const arcOnly = _engineIsMlx() && _modelHasArc();
   const nativeIdx = arcOnly ? [0] : [0, 4];
-  return nativeIdx.includes(idx) ? nativeLen : cropLen;
+  if (!nativeIdx.includes(idx)) return cropLen;
+  if (_platform === 'apple' && seqInfo) {
+    return Math.min(nativeLen, Math.round(_MAC_LONG_DEMO_SECONDS * seqInfo.sr / seqInfo.dsRatio));
+  }
+  return nativeLen;
+}
+
+// Sequence-length slider, shared by New Finetune's "Latent seq length" and each
+// demo's "Duration": log-scaled from ~1 s to the model's max length, so the
+// short end gets most of the travel. Values are integer latents. The position
+// count is chosen so every integer length has its own position (adjacent
+// integers near the top are ~1/(hi·ln(hi/lo)) apart on the log scale), and the
+// arrow keys step exactly ±1 latent.
+function _seqLenBounds(si) {
+  const lo = Math.max(2, Math.round(si.sr / si.dsRatio));  // ~1 s
+  return [lo, Math.max(lo + 1, si.length)];
+}
+function _seqLenSteps(si) {
+  const [lo, hi] = _seqLenBounds(si);
+  return Math.max(1000, 2 * Math.ceil(hi * Math.log(hi / lo)));
+}
+function _seqLenToPos(lat, si) {
+  const [lo, hi] = _seqLenBounds(si);
+  const v = Math.min(hi, Math.max(lo, lat));
+  return Math.round(Math.log(v / lo) / Math.log(hi / lo) * _seqLenSteps(si));
+}
+function _seqPosToLen(pos, si) {
+  const [lo, hi] = _seqLenBounds(si);
+  return Math.min(hi, Math.max(lo, Math.round(lo * Math.pow(hi / lo, pos / _seqLenSteps(si)))));
+}
+function _seqLenLabel(lat, si) {
+  return `${(lat * si.dsRatio / si.sr).toFixed(2)} sec (seq=${lat})`;
+}
+// Wire a range input as a sequence-length slider. onChange(lat) gets the
+// snapped integer length on every drag tick and arrow-key step.
+function _wireSeqSlider(slider, si, lat, onChange) {
+  slider.min = '0';
+  slider.max = String(_seqLenSteps(si));
+  slider.step = '1';
+  slider.value = String(_seqLenToPos(lat, si));
+  slider.oninput = function() { onChange(_seqPosToLen(+this.value, si)); };
+  slider.onkeydown = function(e) {
+    const d = {ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1}[e.key];
+    if (!d) return;
+    e.preventDefault();
+    const [lo, hi] = _seqLenBounds(si);
+    const next = Math.min(hi, Math.max(lo, _seqPosToLen(+this.value, si) + d));
+    this.value = String(_seqLenToPos(next, si));
+    onChange(next);
+  };
 }
 
 let _newFtDemos = _defaultNewFtDemos(8);
@@ -5014,40 +5078,39 @@ function _renderDemoEntries() {
       _newFtDemos[+this.dataset.idx].seed = isNaN(v) ? null : v;
     };
     row2.appendChild(seedInp);
-    // Duration toggle: only show if training crop length differs from model native
+    div.appendChild(row2);
+    // Line 3: demo duration — log slider from ~1 s to the model's max length.
     const _cropEl = document.getElementById('new-ft-crop-length');
-    const _cropLen = _cropEl ? parseInt(_cropEl.value) : 0;
     const _seqInfo = _modelSeqInfo[_ftModel] || _modelSeqInfo['sa3'];
     const _nativeLen = _seqInfo.length;
-    if (_cropLen && _cropLen !== _nativeLen) {
-      const _cropSec = (_cropLen * _seqInfo.dsRatio / _seqInfo.sr).toFixed(0);
-      const _nativeSec = (_nativeLen * _seqInfo.dsRatio / _seqInfo.sr).toFixed(0);
-      // Default duration depends on preset (see _defaultDemoDurationLatents).
-      // d.duration_latents (set by clicking the toggle) overrides.
-      const _defaultDur = _defaultDemoDurationLatents(i, _cropLen, _nativeLen);
-      const curDur = d.duration_latents || _defaultDur;
-      const durWrap = document.createElement('div');
-      durWrap.style.cssText = 'display:flex;border-radius:4px;overflow:hidden;border:1px solid rgba(255,255,255,0.15);cursor:pointer;margin-left:auto';
-      const cropSide = document.createElement('span');
-      cropSide.style.cssText = `padding:2px 8px;font-size:0.75em;white-space:nowrap;${curDur === _cropLen ? 'background:rgba(167,139,250,0.2);color:var(--accent2)' : 'background:transparent;color:#666'}`;
-      cropSide.textContent = `${_cropLen} (${_cropSec}s)`;
-      const nativeSide = document.createElement('span');
-      nativeSide.style.cssText = `padding:2px 8px;font-size:0.75em;white-space:nowrap;${curDur === _nativeLen ? 'background:rgba(167,139,250,0.2);color:var(--accent2)' : 'background:transparent;color:#666'}`;
-      nativeSide.textContent = `${_nativeLen} (${_nativeSec}s)`;
-      durWrap.appendChild(cropSide);
-      durWrap.appendChild(nativeSide);
-      durWrap.dataset.idx = i;
-      durWrap.onclick = function() {
-        const idx = +this.dataset.idx;
-        const demo = _newFtDemos[idx];
-        const defDur = _defaultDemoDurationLatents(idx, _cropLen, _nativeLen);
-        const cur = demo.duration_latents || defDur;
-        demo.duration_latents = cur === _cropLen ? _nativeLen : _cropLen;
-        _renderDemoEntries();
-      };
-      row2.appendChild(durWrap);
-    }
-    div.appendChild(row2);
+    const _cropLen = (_cropEl && parseInt(_cropEl.value)) || _nativeLen;
+    // Default depends on preset + platform (see _defaultDemoDurationLatents);
+    // d.duration_latents (set by moving the slider) overrides.
+    const _defaultDur = _defaultDemoDurationLatents(i, _cropLen, _nativeLen, _seqInfo);
+    const curDur = d.duration_latents || _defaultDur;
+    const row3 = document.createElement('div');
+    row3.style.cssText = 'display:flex;align-items:center;gap:8px;margin-left:24px';
+    const lenLbl = document.createElement('span');
+    lenLbl.style.cssText = 'font-size:0.75em;color:var(--text2)';
+    lenLbl.textContent = 'Duration';
+    const lenSlider = document.createElement('input');
+    lenSlider.type = 'range';
+    lenSlider.style.cssText = 'flex:1;min-width:80px;accent-color:var(--accent2)';
+    lenSlider.title = `Demo duration: ~1 s to the model max (${_seqLenLabel(_nativeLen, _seqInfo)}). Training crop is ${_seqLenLabel(_cropLen, _seqInfo)}.`;
+    const lenVal = document.createElement('span');
+    lenVal.style.cssText = `font-size:0.75em;white-space:nowrap;min-width:140px;text-align:right;color:${curDur === _cropLen ? 'var(--text2)' : 'var(--accent2)'}`;
+    lenVal.textContent = _seqLenLabel(curDur, _seqInfo);
+    const _demoIdx = i;
+    // Update in place while dragging (no list re-render, so the drag isn't lost).
+    _wireSeqSlider(lenSlider, _seqInfo, curDur, lat => {
+      _newFtDemos[_demoIdx].duration_latents = lat;
+      lenVal.textContent = _seqLenLabel(lat, _seqInfo);
+      lenVal.style.color = lat === _cropLen ? 'var(--text2)' : 'var(--accent2)';
+    });
+    row3.appendChild(lenLbl);
+    row3.appendChild(lenSlider);
+    row3.appendChild(lenVal);
+    div.appendChild(row3);
     container.appendChild(div);
   });
   // Hide remove button if only 1 demo
@@ -6046,21 +6109,73 @@ function updateLayerPreview() {
 
 // Sequence info per model — populated from /api/models in _loadRemoteModels.
 const _modelSeqInfo = {};
+// Apple Silicon: new runs default to a 128-latent (~12 s) training crop instead
+// of the model's full length — full-length crops are slow and memory-hungry on
+// an Apple GPU. Any length can still be typed in.
+const _MAC_DEFAULT_CROP_LATENTS = 128;
+let _cropUserEdited = false;  // typed by the user, or restored from a cloned run
 function _updateCropLength() {
   const model = document.getElementById('new-ft-base-model').value || 'sa3';
   const info = _modelSeqInfo[model] || _modelSeqInfo['sa3'];
-  document.getElementById('new-ft-crop-length').value = info.length;
+  document.getElementById('new-ft-crop-length').value =
+    _platform === 'apple' ? Math.min(_MAC_DEFAULT_CROP_LATENTS, info.length) : info.length;
+  _cropUserEdited = false;
   _updateCropSeconds();
+  if (typeof _renderDemoEntries === 'function') _renderDemoEntries();
 }
 function _updateCropSeconds() {
+  // Sync the Latent seq length slider, label and Seq box to the hidden value
+  // (set by the slider, the Seq box, the model default, or a cloned run).
   const model = document.getElementById('new-ft-base-model').value || 'sa3';
   const info = _modelSeqInfo[model] || _modelSeqInfo['sa3'];
-  const length = parseInt(document.getElementById('new-ft-crop-length').value) || info.length;
-  const seconds = (length * info.dsRatio / info.sr).toFixed(2);
-  document.getElementById('new-ft-crop-seconds').value = seconds + 's';
-  const col = length > info.length ? 'var(--orange)' : length < info.length ? 'var(--yellow)' : '';
-  document.getElementById('new-ft-crop-length').style.color = col;
-  document.getElementById('new-ft-crop-seconds').style.color = col || 'var(--text2)';
+  const input = document.getElementById('new-ft-crop-length');
+  const slider = document.getElementById('new-ft-crop-slider');
+  const seqBox = document.getElementById('new-ft-crop-seq');
+  const length = parseInt(input.value) || info.length;
+  const [lo, hi] = _seqLenBounds(info);
+  // A user edit from either control: store it, mirror it in the other, and
+  // refresh everything that depends on the crop.
+  const apply = (lat, from) => {
+    input.value = String(lat);
+    _cropUserEdited = true;
+    if (from !== 'slider') slider.value = String(_seqLenToPos(lat, info));
+    if (from !== 'seq') seqBox.value = String(lat);
+    _updateCropLabel(lat, info);
+    updateCkptEstimate();
+    validateNewFt();
+    _renderDemoEntries();
+  };
+  _wireSeqSlider(slider, info, length, lat => apply(lat, 'slider'));
+  // Seq box: digits only. In-range values apply as you type; out-of-range ones
+  // (e.g. the "4" on the way to "4096") wait, and are clamped on Enter/blur.
+  seqBox.oninput = function() {
+    this.value = this.value.replace(/[^0-9]/g, '');
+    const v = parseInt(this.value, 10);
+    if (v >= lo && v <= hi) apply(v, 'seq');
+  };
+  seqBox.onchange = function() {
+    const v = parseInt(this.value, 10);
+    const lat = isNaN(v) ? (parseInt(input.value) || info.length) : Math.min(hi, Math.max(lo, v));
+    this.value = String(lat);
+    if (lat !== parseInt(input.value)) apply(lat, 'seq');
+    else _updateCropLabel(lat, info);
+  };
+  seqBox.onkeydown = function(e) { if (e.key === 'Enter') { e.preventDefault(); this.onchange(); } };
+  seqBox.value = String(length);
+  _updateCropLabel(length, info);
+}
+function _updateCropLabel(length, info) {
+  const lbl = document.getElementById('new-ft-crop-label');
+  // Seconds only: the Seq box beside it already shows the length.
+  lbl.textContent = `${(length * info.dsRatio / info.sr).toFixed(2)} sec`;
+  // A cloned run can carry a crop above the model max; flag it (slider pins at max).
+  lbl.style.color = length > info.length ? 'var(--orange)' : 'var(--text2)';
+  // Seq box turns yellow at exactly the model's native length.
+  const seqBox = document.getElementById('new-ft-crop-seq');
+  const native = length === info.length;
+  seqBox.style.color = native ? 'var(--yellow)' : '';
+  seqBox.style.borderColor = native ? 'var(--yellow)' : '';
+  seqBox.title = native ? `Model native length (${info.length})` : '';
 }
 function _updateResumeCropSeconds() {
   // Resume modal mirror of _updateCropSeconds. Uses the run's base_model
@@ -6123,6 +6238,7 @@ window.cloneRunSettings = async function() {
     // Populate latent seq length and crop mode
     if (s.latent_crop_length) {
       document.getElementById('new-ft-crop-length').value = s.latent_crop_length;
+      _cropUserEdited = true;
       _updateCropSeconds();
     }
     if (s.random_crop !== undefined) {
@@ -6470,9 +6586,9 @@ window.confirmNewFinetune = async function() {
     if (!d.prompt) entry.fixed_prompt = true;
     const _si = _modelSeqInfo[document.getElementById('new-ft-base-model').value] || _modelSeqInfo['sa3'];
     const _cropL = parseInt(document.getElementById('new-ft-crop-length').value) || _si.length;
-    // Same default rule as _renderDemoEntries (preset-aware via _defaultDemoDurationLatents).
-    // d.duration_latents (toggle override) wins.
-    const _defaultDur = _defaultDemoDurationLatents(i, _cropL, _si.length);
+    // Same default rule as _renderDemoEntries (preset/platform-aware via
+    // _defaultDemoDurationLatents). d.duration_latents (slider override) wins.
+    const _defaultDur = _defaultDemoDurationLatents(i, _cropL, _si.length, _si);
     const effectiveDur = d.duration_latents || _defaultDur;
     if (effectiveDur !== _cropL) {
       entry.duration = effectiveDur * _si.dsRatio / _si.sr;

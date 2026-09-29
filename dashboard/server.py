@@ -506,6 +506,25 @@ GRADIO_PORT_BASE = 7860
 GRADIO_LOG_DIR = STATE_DIR / "gradio_logs"
 GRADIO_LOG_DIR.mkdir(exist_ok=True)
 
+def _user_path(raw):
+    """Resolve a user-pasted/dropped directory string to an absolute Path.
+
+    Tolerates what Finder/Terminal drags produce: `file://` URIs with
+    %-escapes, surrounding quotes, and shell backslash-escaped spaces.
+    """
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        s = s[1:-1]
+    if s.lower().startswith("file:"):
+        parsed = urlparse(s)
+        s = unquote(parsed.path)
+        if parsed.netloc and parsed.netloc != "localhost":
+            s = f"//{parsed.netloc}{s}"
+    elif "\\" in s and not Path(s).expanduser().exists():
+        s = re.sub(r"\\(.)", r"\1", s)
+    return Path(s).expanduser().resolve()
+
+
 def _slugify(name):
     """Sanitize a name to a lowercase slug [a-z0-9._-]."""
     s = name.lower().strip()
@@ -1343,7 +1362,7 @@ def _generate_dataset_ground_truth(dataset_files, dataset_name, model="sa3-mediu
         # Generate spectrogram
         jpg = out_mp3.with_suffix(".jpg")
         if not jpg.exists():
-            _spec_pool.submit(generate_spectrogram, out_mp3, jpg)
+            _submit_spectrogram(out_mp3, jpg)
 
     if not gt_list:
         return None, None
@@ -3047,7 +3066,62 @@ def _extract_hyperparams(run):
     return result if result else None
 
 
-_spec_pool = ThreadPoolExecutor(max_workers=4)
+# MLX host: an Apple-Silicon Mac, where training runs on the MLX engine and
+# shares its cores with this dashboard. Spectrogram housekeeping is gentler
+# there (the _MLX_HOST branches below); CUDA/Linux hosts keep the original
+# behaviour untouched.
+_MLX_HOST = sys.platform == "darwin" and os.uname().machine == "arm64"
+
+# On an MLX host each job is one single-threaded ffmpeg decode plus one render
+# with torch pinned to one thread, so the worker count is roughly the number of
+# cores spectrograms may take — two, leaving the rest to HTTP and the trainer.
+_spec_pool = ThreadPoolExecutor(max_workers=2 if _MLX_HOST else 4,
+                                thread_name_prefix="spectrogram")
+if _MLX_HOST:
+    # torch in this process only does spectrogram STFT/resample. Its default
+    # intra-op pool (one thread per core) multiplied by the workers above
+    # oversubscribed the CPU while a backlog drained.
+    torch.set_num_threads(1)
+
+# MLX host: jpg path -> Future for every spectrogram queued or rendering. The
+# watcher, /api/stream and /api/demos all sweep the same runs, and a clip still
+# waiting in the queue has no .jpg yet, so each sweep queued it again and a
+# backlog grew faster than it drained.
+_spec_inflight = {}
+_spec_inflight_lock = threading.Lock()
+
+
+def _render_spectrograms(pairs):
+    """Render (src_audio, jpg_path) pairs and wait. Serially on this thread as
+    before, except on an MLX host where they go through the deduplicating pool."""
+    if not _MLX_HOST:
+        for src_audio, jpg_path in pairs:
+            generate_spectrogram(src_audio, jpg_path)
+        return
+    for f in [_submit_spectrogram(a, j) for a, j in pairs]:
+        f.result()
+
+
+def _submit_spectrogram(src_audio, jpg_path):
+    """Queue a spectrogram render. On an MLX host, returns the render already
+    queued for jpg_path instead of queueing a duplicate."""
+    if not _MLX_HOST:
+        return _spec_pool.submit(generate_spectrogram, src_audio, jpg_path)
+    key = str(jpg_path)
+    with _spec_inflight_lock:
+        fut = _spec_inflight.get(key)
+        if fut is not None:
+            return fut
+        fut = _spec_pool.submit(generate_spectrogram, src_audio, jpg_path)
+        _spec_inflight[key] = fut
+
+    def _forget(done, key=key):
+        with _spec_inflight_lock:
+            if _spec_inflight.get(key) is done:
+                del _spec_inflight[key]
+    # Outside the lock: a future that already finished runs this inline.
+    fut.add_done_callback(_forget)
+    return fut
 
 # libsndfile 1.2.2's MPEG decoder reports errors by longjmp-ing through a
 # process-global jmpbuf (libmpg123). Two threads decoding mp3s at once race on
@@ -3105,7 +3179,9 @@ def _decode_ffmpeg(path):
     ).stdout.decode().strip().split(",")
     sr, ch = int(probe[0]), int(probe[1])
     raw = subprocess.run(
-        ["ffmpeg", "-v", "quiet", "-i", str(path), "-f", "f32le",
+        ["ffmpeg", "-v", "quiet",
+         *(["-threads", "1"] if _MLX_HOST else []),  # see _spec_pool
+         "-i", str(path), "-f", "f32le",
          "-acodec", "pcm_f32le", "-ac", str(ch), "-"],
         capture_output=True, check=True, timeout=600,
     ).stdout
@@ -3194,11 +3270,30 @@ def generate_spectrogram(mp3_path, jpg_path):
     arrive with a .jpg already written by the training loop, which is why every
     caller checks for one first — see _process_run_demos.
     """
+    if not _MLX_HOST:
+        try:
+            y, sr = _load_audio(mp3_path, target_sr=32000)
+            render_to_jpg(y, sr, jpg_path)
+        except Exception as e:
+            print(f"[spectrogram] Failed for {mp3_path}: {e}")
+        return
+    jpg_path = Path(jpg_path)
+    if jpg_path.exists() and jpg_path.stat().st_size > 0:
+        return
+    # MLX host: render to a temp name and rename, so neither the browser nor a
+    # later sweep (which treats any non-empty .jpg as done) sees a half-written
+    # image.
+    tmp = jpg_path.with_name(f".tmp_{threading.get_ident()}_{jpg_path.name}")
     try:
         y, sr = _load_audio(mp3_path, target_sr=32000)
-        render_to_jpg(y, sr, jpg_path)
+        render_to_jpg(y, sr, tmp)
+        os.replace(tmp, jpg_path)
     except Exception as e:
         print(f"[spectrogram] Failed for {mp3_path}: {e}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def _place_spectrogram(src_audio, jpg_dest, spec_futs):
@@ -3215,7 +3310,7 @@ def _place_spectrogram(src_audio, jpg_dest, spec_futs):
     if jpg_src.exists() and jpg_src.stat().st_size > 0:
         shutil.copy2(jpg_src, jpg_dest)
         return
-    spec_futs.append(_spec_pool.submit(generate_spectrogram, src_audio, jpg_dest))
+    spec_futs.append(_submit_spectrogram(src_audio, jpg_dest))
 
 
 # run_id -> (demo dir mtime, entry count) as of the last completed sweep.
@@ -3249,12 +3344,36 @@ def _demo_dir_fingerprint(demo_source, out_base):
     return (src_mtime, out_mtime)
 
 
+# MLX host: run_ids with a _process_run_demos sweep in progress. Three callers
+# kick sweeps (watcher, /api/stream, /api/demos); a second sweep of the same run
+# would only duplicate the first's work, so it returns immediately instead.
+_run_demo_sweeping = set()
+_run_demo_sweeping_lock = threading.Lock()
+
+
 def _process_run_demos(run, force=False):
     """Process demos for a single run: copy from source dir, generate spectrograms.
 
     Skips entirely when the source dir looks untouched since the last sweep;
     pass force=True to process regardless (used by the explicit REFRESH path).
+    On an MLX host, returns at once if another sweep of this run is running.
     """
+    if not _MLX_HOST:
+        _sweep_run_demos(run, force)
+        return
+    run_id = run["id"]
+    with _run_demo_sweeping_lock:
+        if run_id in _run_demo_sweeping:
+            return
+        _run_demo_sweeping.add(run_id)
+    try:
+        _sweep_run_demos(run, force)
+    finally:
+        with _run_demo_sweeping_lock:
+            _run_demo_sweeping.discard(run_id)
+
+
+def _sweep_run_demos(run, force):
     demo_source = Path(run.get("demo_source_dir", ""))
     if not demo_source.exists():
         return
@@ -3345,6 +3464,7 @@ def process_all_demos():
     # so the spectrogram pool doesn't keep retrying orphan mp3s from
     # deleted entities (and spamming the log on every cycle).
     gt_dir = AUDIO_DIR / "ground_truth"
+    gt_pairs = []
     if gt_dir.exists():
         known_keys = {r["id"] for r in registry.list_runs()}
         for ds in datasets_registry.list_datasets():
@@ -3355,13 +3475,14 @@ def process_all_demos():
                 # Top-level GT mp3 (no subdir) — always process.
                 jpg = child.with_suffix(".jpg")
                 if not jpg.exists():
-                    generate_spectrogram(child, jpg)
+                    gt_pairs.append((child, jpg))
             elif child.is_dir() and child.name in known_keys:
                 for mp3 in child.glob("*.mp3"):
                     jpg = mp3.with_suffix(".jpg")
                     if not jpg.exists():
-                        generate_spectrogram(mp3, jpg)
+                        gt_pairs.append((mp3, jpg))
             # else: orphan subdir from a deleted run/dataset — skip silently.
+    _render_spectrograms(gt_pairs)
 
     for run in registry.list_runs():
         _process_run_demos(run)
@@ -3492,18 +3613,27 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     auto = False  # Too soon, skip
             if (force or auto) and run:
                 DashboardHandler._demo_process_times[run_id] = time.time()
-                try:
-                    # force=True on an explicit REFRESH: the point of the
-                    # button is to re-process, so the unchanged-dir skip in
-                    # _process_run_demos must not swallow it.
-                    t = threading.Thread(target=_process_run_demos, args=(run,),
-                                         kwargs={"force": force}, daemon=True)
-                    t.start()
+
+                # force=True on an explicit REFRESH: the point of the button is
+                # to re-process, so the unchanged-dir skip in _process_run_demos
+                # must not swallow it.
+                def _sweep(run=run, force=force, run_id=run_id):
+                    try:
+                        _process_run_demos(run, force=force)
+                    except Exception as e:
+                        print(f"[refresh-demos] Error processing demos for {run_id}: {e}")
+                    finally:
+                        with DashboardHandler._demo_cache_lock:
+                            DashboardHandler._demo_cache.pop(run_id, None)
+                t = threading.Thread(target=_sweep, daemon=True)
+                t.start()
+                # MLX host: don't wait. Waiting held the request (and the UI's
+                # spinner) for up to 30 s behind any spectrogram backlog; clips
+                # land via /api/stream or the next poll instead.
+                if not _MLX_HOST:
                     t.join(timeout=30)
                     if t.is_alive():
                         print(f"[refresh-demos] Timeout processing demos for {run_id}")
-                except Exception as e:
-                    print(f"[refresh-demos] Error processing demos for {run_id}: {e}")
                 with DashboardHandler._demo_cache_lock:
                     DashboardHandler._demo_cache.pop(run_id, None)
             elif "nocache" in params:
@@ -4428,13 +4558,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         gt_list.append(entry)
                         gt_prompts.append(gt_prompt)
                     # Generate spectrograms for the GT clips
-                    for mp3 in gt_dir.glob("*.mp3"):
-                        jpg = mp3.with_suffix(".jpg")
-                        if not jpg.exists():
-                            try:
-                                generate_spectrogram(mp3, jpg)
-                            except Exception:
-                                pass
+                    try:
+                        _render_spectrograms(
+                            [(mp3, mp3.with_suffix(".jpg"))
+                             for mp3 in gt_dir.glob("*.mp3")
+                             if not mp3.with_suffix(".jpg").exists()])
+                    except Exception:
+                        pass
                     registry.update_run(rid, ground_truth=gt_list, gt_prompts=gt_prompts)
                     print(f"[control] Ground truth ready for {rid}: {len(gt_list)} tracks")
                 except Exception as e:
@@ -5938,7 +6068,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         Returns (file_info_list, total_files, files_with_tags,
         files_with_json, csv_count).
         """
-        p = Path(dir_path).expanduser().resolve()
+        p = _user_path(dir_path)
         audio_files = []
         # Collect ALL .json files for cross-directory sidecar matching
         json_files = {}  # stem -> list of absolute Paths
@@ -6337,7 +6467,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not dir_path:
             self._json_response({"error": "path is required"}, status=400)
             return
-        p = Path(dir_path).expanduser().resolve()
+        p = _user_path(dir_path)
         if not p.is_dir():
             self._json_response({"error": f"Not a directory: {p}"}, status=400)
             return
@@ -6442,7 +6572,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._json_response({"error": f"unknown model: {model}"}, status=400)
             return
 
-        src = Path(src_path).expanduser().resolve()
+        src = _user_path(src_path)
         if not src.is_dir():
             self._json_response({"error": f"Not a directory: {src}"}, status=400)
             return
@@ -6603,7 +6733,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not gpus or not isinstance(gpus, list):
             self._json_response({"error": "gpus array required"}, status=400)
             return
-        input_path = Path(input_dir).expanduser().resolve()
+        input_path = _user_path(input_dir)
         if not input_path.is_dir():
             self._json_response({"error": f"Not a directory: {input_path}"}, status=400)
             return

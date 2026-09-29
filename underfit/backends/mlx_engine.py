@@ -16,6 +16,8 @@ Environment overrides:
   UNDERFIT_MLX_PYTHON        MLX venv python (default <mlx_root>/.venv/bin/python)
   UNDERFIT_MLX_BASE_WEIGHTS  base DiT weights npz (default
                              <mlx_root>/models/mlx/dit_<model>-base_f16.npz)
+  UNDERFIT_SPECTROGRAM_MODULE  set for the trainer (default underfit/spectrogram.py)
+                             so it renders demo spectrograms itself
 """
 import json
 import os
@@ -23,7 +25,10 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 
@@ -590,13 +595,76 @@ def run_mlx_training(args):
 
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
-    # Inherit stdout/stderr: the trainer's tqdm writes straight to the run log
-    # (via lora_train.py's redirected fd), preserving \r so the dashboard
-    # collapses the progress bar and parses every step's postfix metrics.
-    proc = subprocess.Popen(cmd, cwd=os.getcwd(), env=env)
+    # Let the trainer draw each demo's spectrogram from audio in memory (as the
+    # torch loop does) so the dashboard never decodes the mp3. Loaded by path:
+    # the MLX venv has neither underfit nor torch, and the renderer needs neither.
+    env.setdefault("UNDERFIT_SPECTROGRAM_MODULE",
+                   str(_HERE.parent.parent / "spectrogram.py"))
+    # Inherit stdout: the trainer's tqdm writes straight to the run log (via
+    # lora_train.py's redirected fd), preserving \r so the dashboard collapses
+    # the progress bar and parses every step's postfix metrics. stderr is
+    # relayed byte-for-byte to the same place, keeping a tail for the failure
+    # report — it's where Metal errors, aborts and tracebacks land.
+    launched_at = time.time()
+    proc = subprocess.Popen(cmd, cwd=os.getcwd(), env=env, stderr=subprocess.PIPE)
+    stderr_tail = bytearray()
+    relay = threading.Thread(target=_relay_stderr, args=(proc.stderr, stderr_tail),
+                             daemon=True)
+    relay.start()
     code = proc.wait()
+    relay.join(timeout=5)
     print(f"[mlx-engine] MLX trainer exited with code {code}", flush=True)
+    if code != 0:
+        _report_failure(code, cmd, proc.pid, launched_at,
+                        stderr_tail.decode("utf-8", errors="replace"))
     return code
+
+
+_STDERR_TAIL_BYTES = 65536
+
+
+def _relay_stderr(pipe, tail):
+    """Copy the trainer's stderr to ours unchanged (raw chunks, so \r progress
+    redraws survive) and keep the last _STDERR_TAIL_BYTES in `tail`."""
+    out = getattr(sys.stderr, "buffer", None)
+    fd = pipe.fileno()
+    while True:
+        try:
+            chunk = os.read(fd, 8192)
+        except OSError:
+            break
+        if not chunk:
+            break
+        try:
+            if out is not None:
+                out.write(chunk)
+                out.flush()
+            else:
+                sys.stderr.write(chunk.decode("utf-8", errors="replace"))
+                sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        tail += chunk
+        if len(tail) > _STDERR_TAIL_BYTES:
+            del tail[:len(tail) - _STDERR_TAIL_BYTES]
+
+
+def _report_failure(code, cmd, pid, launched_at, stderr_tail):
+    """Print a diagnosis of the failed trainer to the run log and write it to the
+    <log>.exit sidecar, whose first line the dashboard shows as the kill_hint.
+    Never raises: the exit code must reach the caller regardless."""
+    try:
+        from underfit.backends.mlx_diagnose import diagnose
+        log_path = os.environ.get("UNDERFIT_LOG_PATH")
+        summary, report = diagnose(code, cmd, pid=pid, launched_at=launched_at,
+                                   stderr_tail=stderr_tail, log_path=log_path)
+        print(report, flush=True)
+        if log_path:
+            with open(log_path + ".exit", "w") as f:
+                f.write(summary + "\n" + report + "\n")
+    except Exception as e:
+        print(f"[mlx-engine] (failure diagnosis itself failed: {type(e).__name__}: {e})",
+              flush=True)
 
 
 def run_mlx_gradio(model, lora_ckpt_paths, share=False, port=None):

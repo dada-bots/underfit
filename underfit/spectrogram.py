@@ -13,12 +13,21 @@ MPEG path bites. The dashboard uses the second for audio it did not produce
 
 No module-level side effects: safe to import from a trainer, a worker process,
 or the dashboard.
+
+torch is optional. The MLX trainer's venv has none, and loads this file by path
+(UNDERFIT_SPECTROGRAM_MODULE) to render its demos; without torch the STFT and
+resample run in numpy and produce the same image to within JPEG noise. With
+torch present the torch path is used, so dashboard output is unchanged.
 """
 
 import numpy as np
-import torch
 from functools import lru_cache
 from PIL import Image
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 SPEC_BANDS = [
@@ -66,14 +75,47 @@ def _mel_filterbank(n_mels, n_fft, sr, fmax):
     # Slaney area-normalization (matches librosa norm='slaney' default)
     enorm = (2.0 / (pts[2:n_mels + 2] - pts[0:n_mels])).astype(np.float32)
     filt *= enorm[:, None]
-    return torch.from_numpy(filt)
+    return filt
+
+def _stft_power_np(y_ch, n_fft, hop_length):
+    """numpy twin of torch.stft(center=True, pad_mode='reflect', periodic hann)
+    followed by |.|^2, shaped (n_fft // 2 + 1, n_frames)."""
+    y = np.pad(np.asarray(y_ch, dtype=np.float32), n_fft // 2, mode="reflect")
+    win = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n_fft) / n_fft)).astype(np.float32)
+    frames = np.lib.stride_tricks.sliding_window_view(y, n_fft)[::hop_length] * win
+    spec = np.fft.rfft(frames, axis=-1)
+    return (spec.real ** 2 + spec.imag ** 2).astype(np.float32).T
 
 def _melspectrogram(y_ch, sr, n_mels=30, fmax=16000, hop_length=2048, n_fft=2048):
+    fb = _mel_filterbank(n_mels, n_fft, sr, fmax)
+    if torch is None:
+        return fb @ _stft_power_np(y_ch, n_fft, hop_length)
     y_t = torch.from_numpy(np.ascontiguousarray(y_ch)).float()
     win = torch.hann_window(n_fft)
     spec = torch.stft(y_t, n_fft=n_fft, hop_length=hop_length, window=win,
                       center=True, return_complex=True, pad_mode='reflect')
-    return (_mel_filterbank(n_mels, n_fft, sr, fmax) @ spec.abs().square()).numpy()
+    return (torch.from_numpy(fb) @ spec.abs().square()).numpy()
+
+
+def resample_linear(y, sr, target_sr):
+    """Linear resample matching the dashboard's
+    F.interpolate(mode='linear', align_corners=False), in numpy, so a torch-free
+    caller feeds render_to_jpg the same samples the dashboard would. `y` is
+    (channels, samples) or (samples,); returns float32 of the same rank."""
+    y = np.asarray(y, dtype=np.float32)
+    if sr == target_sr:
+        return y
+    n_in = y.shape[-1]
+    n_out = int(round(n_in * target_sr / sr))
+    # Source positions in float32 like torch's kernel: over millions of samples
+    # float64 positions drift into different neighbour pairs.
+    f32 = np.float32
+    src = (np.arange(n_out, dtype=f32) + f32(0.5)) * f32(n_in / n_out) - f32(0.5)
+    np.maximum(src, 0, out=src)
+    i0 = src.astype(np.int64)
+    i1 = np.minimum(i0 + 1, n_in - 1)
+    lam = src - i0.astype(f32)
+    return (1 - lam) * y[..., i0] + lam * y[..., i1]
 
 def _power_to_db(S, top_db=80.0):
     log_spec = 10.0 * np.log10(np.maximum(S, 1e-10))

@@ -56,6 +56,21 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Tracked, ship-with-the-repo paths
 MODELS_SHIPPED_DIR = DASHBOARD_DIR / "models"   # per-model {registry.json, training_template.json}
+
+# Additional model-registry roots outside the repo, colon-separated like PATH
+# (semicolon on Windows). Same layout as MODELS_SHIPPED_DIR:
+# <root>/<key>/{registry.json,training_template.json}.
+#
+# This exists so a private model can be registered without its name, paths or
+# config ever entering the working tree. Keeping the registry inside the repo and
+# listing it in .gitignore would not do: .gitignore is itself committed, so the
+# model's name would be published in it. Pointing outside the repo means there is
+# nothing to leak and nothing for `git clean` to delete.
+EXTRA_MODELS_DIRS = [
+    Path(p).expanduser()
+    for p in os.environ.get("UNDERFIT_EXTRA_MODELS_DIR", "").split(os.pathsep)
+    if p.strip()
+]
 PRE_DIR = BASE_DIR / "dataset_processing"       # autotagger, pre_encode, metadata helpers
 IS_WINDOWS = os.name == "nt"
 
@@ -223,11 +238,19 @@ def _ensure_hf_snapshot_link(target_dir, repo_id):
         print(f"[models] couldn't link {target_dir} -> {snapshot_dir}: {e}")
 
 def _load_models_from_json():
-    """Walk dashboard/models/*/registry.json and merge into MODEL_INFO / ENCODING_MODELS / SHARED_ENCODERS."""
-    if not MODELS_SHIPPED_DIR.is_dir():
+    """Walk each model-registry root and merge into MODEL_INFO / ENCODING_MODELS / SHARED_ENCODERS.
+
+    Roots are the shipped dashboard/models plus anything in UNDERFIT_EXTRA_MODELS_DIR,
+    so a private model can be registered from outside the repo.
+    """
+    registry_paths = []
+    for _root in (MODELS_SHIPPED_DIR, *EXTRA_MODELS_DIRS):
+        if _root.is_dir():
+            registry_paths.extend(sorted(_root.glob("*/registry.json")))
+    if not registry_paths:
         return
     subs = {"models_dir": str(MODELS_DIR)}
-    for registry_path in sorted(MODELS_SHIPPED_DIR.glob("*/registry.json")):
+    for registry_path in registry_paths:
         with open(registry_path) as f:
             raw = _json.load(f)
         m = _resolve_paths(raw, subs)

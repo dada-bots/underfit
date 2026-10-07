@@ -23,7 +23,7 @@ import torch
 from tqdm import tqdm
 
 from underfit.training.demo_step import run_demo_step
-from underfit.training.prompt_preview import print_prompt_preview
+from underfit.training.prompt_preview import print_prompt_preview, ensure_prompt_config
 from underfit.training.lora import apply_lora_from_config, load_lora_resume, save_lora_step
 from underfit.training.loss import compute_masked_loss, compute_normalized_mse
 from underfit.training.optim import create_optimizer_from_config, create_scheduler_from_config
@@ -390,6 +390,17 @@ def run_training(args, backend):
         persistent_workers=_persistent,
     )
 
+    # stable-audio-tools loads the metadata module itself, so prompt_config has
+    # not reached it yet. Do that before the preview — the preview iterates the
+    # dataloader, which is when workers snapshot the module globals.
+    try:
+        _configured = ensure_prompt_config(train_dl, dataset_config)
+        if _configured:
+            print(f"[prompts] applied prompt_config to {_configured} metadata "
+                  f"module(s)", flush=True)
+    except Exception as e:
+        print(f"[prompts] could not apply prompt_config: {type(e).__name__}: {e}", flush=True)
+
     # Show what the conditioner will actually be fed, on every start and resume.
     # Sampled through the dataset the loop is about to consume, so a broken
     # prompt pipeline is visible here instead of only in the finished model.
@@ -521,15 +532,25 @@ def run_training(args, backend):
                 import traceback
                 traceback.print_exc()
 
+        # One bar for the whole run, not one per epoch. A small dataset can make an
+        # epoch a single batch, and a per-epoch bar was then created, rendered
+        # "0/1 [00:00<?, ?it/s]" and destroyed before tqdm had two samples to derive
+        # a rate from -- so no it/s and no ETA ever appeared, and the bar was rebuilt
+        # once per step. Scoping it to training steps makes rate and ETA meaningful
+        # at any dataset size. `initial` keeps a resumed run's bar honest.
+        #
+        # The "Step N, Epoch M" description stays: the dashboard reads the step from
+        # that prefix (_parse_latest_step) and groups bar lines by it (_pbar_signature).
+        pbar = tqdm(
+            total=max_steps,
+            initial=raw_step,
+            desc=f"Step {raw_step + step_offset}, Epoch {epoch}",
+            mininterval=0,
+            miniters=1,
+            file=sys.stdout,
+        )
         while raw_step < max_steps:
-            pbar = tqdm(
-                train_dl,
-                desc=f"Step {raw_step + step_offset}, Epoch {epoch}",
-                mininterval=0,
-                miniters=1,
-                file=sys.stdout,
-            )
-            for batch_idx, batch in enumerate(pbar):
+            for batch_idx, batch in enumerate(train_dl):
                 if raw_step >= max_steps:
                     break
                 global_step = raw_step + step_offset
@@ -663,6 +684,7 @@ def run_training(args, backend):
                 lbt_log.write(global_step, t.detach().float().mean().item(), loss.item())
 
                 raw_step += 1
+                pbar.update(1)
                 global_step = raw_step + step_offset
                 # Update progress bar prefix with the just-completed global step.
                 # Dashboard regex still matches "Epoch (\d+):" via re.search.
@@ -731,5 +753,9 @@ def run_training(args, backend):
             save_lora_step(backend, model, saved_lora_cfg, out, step=global_step, epoch=epoch, base_model=base_model_name)
             print(f"✓ Saved checkpoint -- {os.path.basename(out)} (final)", flush=True)
     finally:
+        try:
+            pbar.close()
+        except Exception:
+            pass
         lbt_log.close()
         print("Training done", flush=True)

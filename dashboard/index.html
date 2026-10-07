@@ -294,6 +294,15 @@
     margin: 0 auto; transition: max-width 0.3s ease;
   }
   .demo-table.expand-mode { max-width: 1000px; }
+  /* Header row: the gradio button sits inline just right of "Step N".
+     Baseline alignment keeps it sitting on the heading's text baseline rather
+     than floating against the cap height. It is a sibling of .step-heading, not
+     a child, so it does not inherit that element's 1.4em. */
+  .demo-table-head { display: flex; align-items: baseline;
+    justify-content: flex-start; }
+  .demo-table-head .step-heading { margin-bottom: 12px; }
+  .demo-gradio-btn { flex-shrink: 0; margin-left: 14px;
+    font-size: 0.72em; padding: 3px 9px; }
   .step-heading {
     font-size: 1.4em; font-weight: 800; color: var(--accent2); margin-bottom: 12px;
     letter-spacing: 0.05em;
@@ -884,6 +893,22 @@
   .modal-select:focus { outline: none; border-color: var(--accent); }
   .modal-label { color: var(--text2); font-size: 0.8em; margin-bottom: 4px; display: block; }
   .resume-error { color: var(--red); font-size: 0.8em; margin-top: 4px; min-height: 1.2em; }
+  /* X-axis crop under the loss chart */
+  .chart-crop { display: flex; align-items: center; gap: 10px; margin-top: 8px;
+    font-size: 0.75em; color: var(--text2); }
+  .crop-track { position: relative; flex: 1; height: 20px; border-radius: 4px;
+    background: rgba(148,163,184,0.14); cursor: pointer; touch-action: none;
+    user-select: none; overflow: hidden; }
+  .crop-sel { position: absolute; top: 0; bottom: 0;
+    background: rgba(167,139,250,0.35); pointer-events: none; }
+  /* The 16px box is the grab target; the visible grip is the bar drawn inside
+     it, so the handle stays easy to hit without looking heavy. */
+  .crop-handle { position: absolute; top: 0; bottom: 0; width: 16px;
+    cursor: ew-resize; touch-action: none; user-select: none; }
+  .crop-handle::before { content: ''; position: absolute; top: 0; bottom: 0;
+    left: 50%; transform: translateX(-50%); width: 4px; border-radius: 2px;
+    background: #a78bfa; }
+  .crop-handle:hover::before, .crop-handle.dragging::before { background: #c4b5fd; }
   .resume-info { color: var(--text2); font-size: 0.85em; margin-bottom: 12px; }
 
   /* Console log tail */
@@ -1099,6 +1124,16 @@
       <h2>Loss</h2>
       <div class="chart-container-sm">
         <canvas id="loss-chart"></canvas>
+      </div>
+      <div class="chart-crop" id="loss-crop">
+        <div class="crop-track" id="loss-crop-track">
+          <div class="crop-sel" id="loss-crop-sel"></div>
+          <div class="crop-handle" id="loss-crop-h-lo" data-side="lo"></div>
+          <div class="crop-handle" id="loss-crop-h-hi" data-side="hi"></div>
+        </div>
+        <button class="gradio-btn" id="loss-crop-reset"
+                style="font-size:0.7em;padding:2px 8px;min-width:0"
+                onclick="resetLossCrop()">RESET</button>
       </div>
     </div>
     <div class="section" id="lbt-chart-section" style="display:none">
@@ -1722,6 +1757,31 @@ class MetricChart {
     this.showRaw = opts.showRaw !== false;
     this.emptyText = opts.emptyText || 'Collecting data...';
     this.title = opts.title || '';
+    // X-axis crop as fractions of the full step span, so the view survives new
+    // data arriving (an index-based crop would drift as the run grows).
+    this.cropLo = 0;
+    this.cropHi = 1;
+  }
+  setCrop(lo, hi) {
+    this.cropLo = Math.max(0, Math.min(1, lo));
+    this.cropHi = Math.max(0, Math.min(1, hi));
+    this._lastLen = -1;   // force the next update() through
+    this.draw();
+  }
+  cropBounds() {
+    const steps = (this.data || []).map(d => d.step);
+    if (!steps.length) return null;
+    const minS = Math.min(...steps), maxS = Math.max(...steps);
+    const span = (maxS - minS) || 1;
+    return { minS, maxS, lo: minS + span * this.cropLo, hi: minS + span * this.cropHi };
+  }
+  _visible() {
+    if (this.cropLo <= 0 && this.cropHi >= 1) return this.data;
+    const b = this.cropBounds();
+    if (!b) return this.data;
+    const out = this.data.filter(d => d.step >= b.lo && d.step <= b.hi);
+    // Never blank the chart: an over-tight crop falls back to the full series.
+    return out.length >= 2 ? out : this.data;
   }
   ema(values) {
     // smoothing == 0 means no smoothing; return values as-is (avoids the
@@ -1761,9 +1821,10 @@ class MetricChart {
     const W = rect.width, H = rect.height;
     c.clearRect(0, 0, W, H);
     const vk = this.valueKey;
-    const validData = this.data.filter(d => d[vk] !== null);
-    const nanSteps = this.data.filter(d => d[vk] === null).map(d => d.step);
-    const allSteps = this.data.map(d => d.step);
+    const _view = this._visible();
+    const validData = _view.filter(d => d[vk] !== null);
+    const nanSteps = _view.filter(d => d[vk] === null).map(d => d.step);
+    const allSteps = _view.map(d => d.step);
     // Edge case: all data is NaN or not enough valid points
     if (validData.length < 2 && nanSteps.length > 0) {
       c.fillStyle = 'rgba(239, 68, 68, 0.15)';
@@ -1778,7 +1839,7 @@ class MetricChart {
       }
       return;
     }
-    if (this.data.length < 2) {
+    if (_view.length < 2) {
       c.fillStyle = '#94a3b8'; c.font = '14px monospace'; c.textAlign = 'center';
       c.fillText(this.emptyText, W/2, H/2); return;
     }
@@ -1905,6 +1966,95 @@ const lrChart = new MetricChart(document.getElementById('lr-chart'), {
   smoothing: 0,  // LR is deterministic; no need to smooth
   showRaw: false, emptyText: 'Waiting for LR data...'
 });
+// ── Loss-chart X crop ──────────────────────────────────────────────────────
+// An extreme first-step loss squashes everything after it into a flat line.
+// Cropping the X range lets Y autoscale to what is left, which is the only way
+// to read the tail without log-scaling the whole chart.
+const _LOSS_MIN_SPAN = 0.02;   // never crop below 2% of the range
+let _lossCrop = { lo: 0, hi: 1 };
+let _lossDrag = null;
+
+function _lossCropFrac(clientX) {
+  const t = document.getElementById('loss-crop-track');
+  const r = t.getBoundingClientRect();
+  if (!r.width) return 0;
+  return Math.max(0, Math.min(1, (clientX - r.left) / r.width));
+}
+
+function _paintLossCrop() {
+  const sel = document.getElementById('loss-crop-sel');
+  const hLo = document.getElementById('loss-crop-h-lo');
+  const hHi = document.getElementById('loss-crop-h-hi');
+  if (!sel) return;
+  const lo = _lossCrop.lo * 100, hi = _lossCrop.hi * 100;
+  sel.style.left = lo + '%';
+  sel.style.width = (hi - lo) + '%';
+  // The 4px bar sits centred in a 16px grab box, i.e. 6..10px inside it, so the
+  // box is offset -8px to centre the bar on the boundary. At the extremes that
+  // would leave a 6px gap against the track edge, so shift the box to put the
+  // bar flush instead: -6px pins its left edge at 0, 100%-10px its right at W.
+  hLo.style.left = _lossCrop.lo <= 0 ? '-6px' : `calc(${lo}% - 8px)`;
+  hHi.style.left = _lossCrop.hi >= 1 ? 'calc(100% - 10px)' : `calc(${hi}% - 8px)`;
+}
+
+function _applyLossCrop() {
+  chart.setCrop(_lossCrop.lo, _lossCrop.hi);
+  _paintLossCrop();
+}
+
+function _lossCropMove(ev) {
+  if (!_lossDrag) return;
+  const f = _lossCropFrac(ev.clientX);
+  if (_lossDrag === 'lo') _lossCrop.lo = Math.min(f, _lossCrop.hi - _LOSS_MIN_SPAN);
+  else                    _lossCrop.hi = Math.max(f, _lossCrop.lo + _LOSS_MIN_SPAN);
+  _lossCrop.lo = Math.max(0, _lossCrop.lo);
+  _lossCrop.hi = Math.min(1, _lossCrop.hi);
+  _applyLossCrop();
+  ev.preventDefault();
+}
+
+function _lossCropUp() {
+  if (!_lossDrag) return;
+  document.getElementById('loss-crop-h-' + _lossDrag).classList.remove('dragging');
+  _lossDrag = null;
+  window.removeEventListener('pointermove', _lossCropMove);
+  window.removeEventListener('pointerup', _lossCropUp);
+}
+
+function _initLossCrop() {
+  const track = document.getElementById('loss-crop-track');
+  if (!track || track._wired) return;
+  track._wired = true;
+  for (const side of ['lo', 'hi']) {
+    document.getElementById('loss-crop-h-' + side).addEventListener('pointerdown', ev => {
+      _lossDrag = side;
+      ev.target.classList.add('dragging');
+      window.addEventListener('pointermove', _lossCropMove);
+      window.addEventListener('pointerup', _lossCropUp);
+      ev.preventDefault();
+    });
+  }
+  // Click anywhere on the track moves the nearer bracket to that point.
+  track.addEventListener('pointerdown', ev => {
+    if (ev.target.classList.contains('crop-handle')) return;
+    const f = _lossCropFrac(ev.clientX);
+    const side = Math.abs(f - _lossCrop.lo) <= Math.abs(f - _lossCrop.hi) ? 'lo' : 'hi';
+    _lossDrag = side;
+    document.getElementById('loss-crop-h-' + side).classList.add('dragging');
+    window.addEventListener('pointermove', _lossCropMove);
+    window.addEventListener('pointerup', _lossCropUp);
+    _lossCropMove(ev);
+  });
+  _paintLossCrop();
+}
+
+function resetLossCrop() {
+  _lossCrop = { lo: 0, hi: 1 };
+  _applyLossCrop();
+}
+
+document.addEventListener('DOMContentLoaded', _initLossCrop);
+
 let demoData = null;
 let activeView = null; // 'gt' or step number
 let _pendingStepFromUrl = null; // set by URL parse, consumed after demo data loads
@@ -2250,6 +2400,117 @@ function fmtStep(step) {
   // Compact display
   if (s >= 1000 && s % 1000 === 0) return (s / 1000) + 'k';
   return s.toLocaleString();
+}
+
+// ── Launch a gradio straight from a demo row ──────────────────────────────
+// The demo's step rarely has a checkpoint of its own (demos fire more often than
+// saves), so fall back to the newest checkpoint at or before it and say so on
+// the button rather than launching something the user did not ask for.
+function _ckptStepOf(c) {
+  const m = String((c && (c.path || c.name)) || '').match(/step=(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function findCkptForStep(step) {
+  let best = null, bestStep = -1;
+  for (const c of (_currentCheckpoints || [])) {
+    const s = _ckptStepOf(c);
+    if (s !== null && s <= step && s > bestStep) { best = c; bestStep = s; }
+  }
+  return best ? { ckpt: best, step: bestStep } : null;
+}
+
+function scrollToCheckpoints() {
+  const el = document.getElementById('checkpoints');
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function launchGradioFromDemo(path, name) {
+  openGpuModal(path, name);
+  // The status ("Starting", then OPEN) lives in the Checkpoints box, which is
+  // usually scrolled off above the demos. Take the user there so the launch is
+  // visible instead of appearing to do nothing.
+  scrollToCheckpoints();
+}
+
+function demoGradioBtn(step) {
+  const hit = findCkptForStep(step);
+  if (!hit) return '';
+  const inst = (gradioInstances || []).find(g =>
+    g.checkpoint_path === hit.ckpt.path &&
+    (g.status === 'ready' || g.status === 'starting')
+  );
+  if (inst && inst.status === 'ready') {
+    const url = inst.share_url || inst.local_url || '#';
+    return `<a href="${escAttr(url)}" target="_blank" rel="noopener"`
+      + ` class="gradio-btn open demo-gradio-btn" onclick="event.stopPropagation()">OPEN GRADIO</a>`;
+  }
+  if (inst && inst.status === 'starting') {
+    return `<button class="gradio-btn demo-gradio-btn"`
+      + ` style="border-color:var(--yellow);color:var(--yellow)"`
+      + ` onclick="event.stopPropagation();scrollToCheckpoints()">STARTING…</button>`;
+  }
+  const label = (hit.step === step)
+    ? 'LAUNCH GRADIO'
+    : `LAUNCH GRADIO (${fmtStep(hit.step)} Steps)`;
+  return `<button class="gradio-btn launch demo-gradio-btn"`
+    + ` onclick="event.stopPropagation();launchGradioFromDemo('${escAttr(hit.ckpt.path)}','${escAttr(hit.ckpt.name)}')">`
+    + `${label}</button>`;
+}
+
+// ── Gradio failure surfacing ──────────────────────────────────────────────
+let _gradioErrorsNotified = new Set();
+
+async function showGradioFailure(instanceId) {
+  const inst = (gradioInstances || []).find(g => g.id === instanceId) || {};
+  let log = '(no log available)';
+  try {
+    const r = await fetch(`/api/gradio/${encodeURIComponent(instanceId)}/log?tail=400`);
+    if (r.ok) { const d = await r.json(); log = d.content || log; }
+  } catch (e) { log = 'Could not read the log: ' + e; }
+  const title = inst.checkpoint_name ? `Gradio failed — ${inst.checkpoint_name}` : 'Gradio failed to load';
+  const reason = inst.error ? `<div style="margin-bottom:8px;color:var(--red)">${_escAttr(inst.error)}</div>` : '';
+  const body = reason
+    + `<div style="margin-bottom:6px;color:var(--text2);font-size:0.85em">`
+    + `The gradio process exited before it finished loading. Log tail:</div>`
+    + `<textarea readonly style="width:100%;height:260px;resize:vertical;`
+    + `font-family:ui-monospace,Menlo,monospace;font-size:0.78em;line-height:1.4;`
+    + `background:var(--bg0,#111);color:var(--text1);border:1px solid var(--text2);`
+    + `border-radius:4px;padding:8px;white-space:pre;overflow:auto">${_escAttr(log)}</textarea>`;
+  _showSeedDialog(title, body, [
+    { label: 'RELAUNCH', onClick: () => relaunchGradio(instanceId) },
+    { label: 'Close' },
+  ]);
+}
+
+async function relaunchGradio(instanceId) {
+  const inst = (gradioInstances || []).find(g => g.id === instanceId);
+  if (!inst) return;
+  _gradioErrorsNotified.delete(instanceId);
+  try {
+    await fetch(`/api/gradio/${encodeURIComponent(instanceId)}`, { method: 'DELETE' });
+  } catch (e) { /* already gone is fine */ }
+  try {
+    const r = await fetch('/api/gradio', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ checkpoint_path: inst.checkpoint_path, gpu: inst.gpu,
+                             run_id: inst.run_id }),
+    });
+    const d = await r.json();
+    if (d.error) _showSeedDialog('Relaunch failed', _escAttr(d.error), [{ label: 'Close' }]);
+  } catch (e) {
+    _showSeedDialog('Relaunch failed', String(e), [{ label: 'Close' }]);
+  }
+}
+
+// Pop the dialog once per failure, the moment an instance flips to error.
+function _checkGradioFailures() {
+  for (const g of (gradioInstances || [])) {
+    if (g.status === 'error' && !_gradioErrorsNotified.has(g.id)) {
+      _gradioErrorsNotified.add(g.id);
+      showGradioFailure(g.id);
+    }
+  }
 }
 
 function fmtMtime(ts) {
@@ -2790,7 +3051,9 @@ function renderDemoContent(force) {
   let stepHeading = stepData.step === 0 ? 'Step 0 <span style="color:var(--text2);font-size:0.75em">(no finetuning yet)</span>' : `Step ${fmtStep(stepData.step)}`;
   const dsLine = (demoData.multi_dataset && stepData.dataset_name)
     ? `<div class="step-ds-line">${stepData.dataset_name}</div>` : '';
-  let html = `<div class="demo-table"><div class="step-heading">${stepHeading}</div>${dsLine}<div class="demo-cols">`;
+  let html = `<div class="demo-table"><div class="demo-table-head">`
+    + `<div class="step-heading">${stepHeading}</div>${demoGradioBtn(stepData.step)}</div>`
+    + `${dsLine}<div class="demo-cols">`;
   const clips = stepData.clips.sort((a,b) => {
     const ai = typeof a.index === 'number' ? a.index : 9999;
     const bi = typeof b.index === 'number' ? b.index : 9999;
@@ -3540,6 +3803,7 @@ async function refreshGradio() {
   try {
     const res = await fetch('/api/gradio');
     gradioInstances = await res.json();
+    _checkGradioFailures();
   } catch (e) {
     console.error('Failed to refresh gradio:', e);
   }
@@ -4237,8 +4501,11 @@ function _renderCheckpoints(data, refreshRunId) {
 
     if (checkpoints.length) {
       function renderCkptRow(c) {
+        // 'error' included: a failed launch used to drop out of this filter, so the
+        // row silently reverted to LAUNCH and the failure was invisible.
         const ckptGradio = gradioInstances.find(g =>
-          g.checkpoint_path === c.path && (g.status === 'starting' || g.status === 'ready')
+          g.checkpoint_path === c.path &&
+          (g.status === 'starting' || g.status === 'ready' || g.status === 'error')
         );
         let gradioHtml = '';
         if (ckptGradio && ckptGradio.status === 'starting') {
@@ -4246,8 +4513,14 @@ function _renderCheckpoints(data, refreshRunId) {
         } else if (ckptGradio && ckptGradio.status === 'ready') {
           const openUrl = ckptGradio.share_url || ckptGradio.local_url || '#';
           gradioHtml = `<span class="ckpt-gradio-status"><span style="color:var(--text2);font-size:0.8em;margin:0 6px">GPU ${ckptGradio.gpu}</span> <a href="${escAttr(openUrl)}" target="_blank" rel="noopener" class="gradio-btn open">OPEN</a> <button class="gradio-btn kill" onclick="stopGradio('${escAttr(ckptGradio.id)}')">KILL</button></span>`;
+        } else if (ckptGradio && ckptGradio.status === 'error') {
+          const emsg = ckptGradio.error ? ` title="${escAttr(ckptGradio.error)}"` : '';
+          gradioHtml = `<span class="ckpt-gradio-status"><span style="color:var(--red);font-weight:600"${emsg}>Error</span>`
+            + ` <span style="color:var(--text2);font-size:0.8em;margin:0 6px">GPU ${ckptGradio.gpu}</span>`
+            + ` <button class="gradio-btn" style="border-color:var(--yellow);color:var(--yellow)" onclick="event.stopPropagation();showGradioFailure('${escAttr(ckptGradio.id)}')">LOGS</button>`
+            + ` <button class="gradio-btn launch" onclick="event.stopPropagation();relaunchGradio('${escAttr(ckptGradio.id)}')">RELAUNCH</button></span>`;
         } else {
-          gradioHtml = `<button class="gradio-btn launch" onclick="openGpuModal('${escAttr(c.path)}','${escAttr(c.name)}')">LAUNCH</button>`;
+          gradioHtml = `<button class="gradio-btn launch" onclick="openGpuModal('${escAttr(c.path)}','${escAttr(c.name)}')">LAUNCH GRADIO</button>`;
         }
         const mtime = c.mtime ? `<span class="ckpt-size">${fmtMtime(c.mtime)}</span>` : '';
         const sessionTag = '';
@@ -4908,7 +5181,8 @@ function _seqPosToLen(pos, si) {
   return Math.min(hi, Math.max(lo, Math.round(lo * Math.pow(hi / lo, pos / _seqLenSteps(si)))));
 }
 function _seqLenLabel(lat, si) {
-  return `${(lat * si.dsRatio / si.sr).toFixed(2)} sec (seq=${lat})`;
+  const secs = lat * si.dsRatio / si.sr;
+  return `${_fmtDur(secs)} (${secs.toFixed(2)}s, seq=${lat})`;
 }
 // Wire a range input as a sequence-length slider. onChange(lat) gets the
 // snapped integer length on every drag tick and arrow-key step.
@@ -4949,7 +5223,7 @@ function _renderDemoEntries() {
     inp.type = 'text';
     inp.className = 'resume-input';
     inp.style.cssText = 'flex:1;font-size:0.85em;padding:4px 8px';
-    inp.placeholder = '(unconditional)';
+    inp.placeholder = '(no prompt)';
     inp.value = d.prompt;
     inp.dataset.idx = i;
     inp.oninput = function() { _newFtDemos[+this.dataset.idx].prompt = this.value; };
@@ -6167,7 +6441,8 @@ function _updateCropSeconds() {
 function _updateCropLabel(length, info) {
   const lbl = document.getElementById('new-ft-crop-label');
   // Seconds only: the Seq box beside it already shows the length.
-  lbl.textContent = `${(length * info.dsRatio / info.sr).toFixed(2)} sec`;
+  const _secs = length * info.dsRatio / info.sr;
+  lbl.textContent = `${_fmtDur(_secs)} (${_secs.toFixed(2)}s)`;
   // A cloned run can carry a crop above the model max; flag it (slider pins at max).
   lbl.style.color = length > info.length ? 'var(--orange)' : 'var(--text2)';
   // Seq box turns yellow at exactly the model's native length.
@@ -6882,10 +7157,15 @@ function _validateStep3() {
   const err = document.getElementById('new-ft-step3-error');
   const cfg = _newFtPromptConfig;
   if (!cfg.useTags && !cfg.usePaths && !cfg.useFixed) {
-    err.textContent = 'Enable at least one prompt method';
-    btn.disabled = true;
+    // Not an error: training with no prompts is a legitimate choice (fully
+    // unconditional). State the consequence and let it through, rather than
+    // describing an outcome in red and then refusing to allow it.
+    err.textContent = 'No prompts will be used during training';
+    err.style.color = 'var(--yellow)';
+    btn.disabled = false;
   } else {
     err.textContent = '';
+    err.style.color = '';
     btn.disabled = false;
   }
 }
@@ -8369,6 +8649,7 @@ function _streamConnect() {
     }
     if (d.gradio) {
       gradioInstances = d.gradio;
+      _checkGradioFailures();
     }
     if (d.checkpoints) {
       _renderCheckpoints(d.checkpoints, currentRunId);

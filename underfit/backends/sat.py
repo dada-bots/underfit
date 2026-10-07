@@ -149,6 +149,14 @@ def create_gradio_ui(*, model_config_path=None, ckpt_path=None, pretrained_name=
                      lora_ckpt_paths=None, default_prompt=None):
     """Build the gradio interface (model loading + UI construction) for SAT-dev."""
     from stable_audio_tools.interface.gradio import create_ui
+    # create_ui asserts pretrained_name XOR (model_config_path and ckpt_path).
+    # The dashboard always passes --pretrained-name, because engine=mlx needs it to
+    # resolve --dit, and the sa3 backend simply prefers it over the explicit paths.
+    # sat forwarded all three and tripped the assertion, so every dashboard-launched
+    # sat gradio died before loading. Explicit paths win here: they point at the
+    # run's own checkpoint, which is the thing the user asked to listen to.
+    if model_config_path and ckpt_path:
+        pretrained_name = None
     return create_ui(
         model_config_path=model_config_path,
         ckpt_path=ckpt_path,

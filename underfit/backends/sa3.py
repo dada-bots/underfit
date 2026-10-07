@@ -450,6 +450,15 @@ def create_gradio_ui(*, model_config_path=None, ckpt_path=None, pretrained_name=
     from stable_audio_3.interface.diffusion_cond import create_diffusion_cond_ui
     from stable_audio_3.model import StableAudioModel
 
+    # The dashboard always passes --pretrained-name: engine=mlx needs it to resolve
+    # --dit. It is a dashboard registry key ("sa3-medium"), not a from_pretrained
+    # key ("medium"), so preferring it over the explicit paths made every
+    # dashboard-launched sa3 gradio die with "Unknown model 'sa3-medium'".
+    # Explicit paths win -- they point at the run's own checkpoint, which is what
+    # the user asked to listen to.
+    if model_config_path and ckpt_path:
+        pretrained_name = None
+
     if pretrained_name:
         pipe = StableAudioModel.from_pretrained(
             pretrained_name,

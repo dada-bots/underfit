@@ -1615,6 +1615,20 @@ class GradioManager:
             # MPLBACKEND=Agg overrides Colab's inherited
             # 'module://matplotlib_inline.backend_inline' which is invalid in
             # a non-IPython subprocess (matplotlib crashes on import).
+            # --pretrained-name exists only for engine=mlx, whose resolve_dit_model
+            # needs it to pick --dit when the run's _model.json carries no 'base_model'.
+            # Every config the dashboard writes today has that key, so this is a
+            # fallback for older ones rather than the normal path.
+            #
+            # It must not reach the torch backends. The value is a dashboard registry
+            # key ("sa3-medium"), not a loader key ("medium"): sa3 preferred it over
+            # the explicit config/ckpt and died on an unknown model, and sat forwarded
+            # it into create_ui's pretrained-name-XOR-config assertion. Either way the
+            # launch was killed before the model loaded.
+            pretrained_name_arg = (
+                f"--pretrained-name {shlex.quote(base_model)} "
+                if engine == "mlx" else ""
+            )
             cmd = (
                 f"source {_bash_quote(VENV_ACTIVATE)} && "
                 f"{backend_env}{_cuda_env_prefix(gpu)}GRADIO_SERVER_PORT={port} "
@@ -1625,10 +1639,7 @@ class GradioManager:
                 f"--ckpt-path {_bash_quote(ckpt_path_model)} "
                 f"{lora_args} "
                 f"--engine {engine} "
-                # base_model name for engine=mlx: the run's _model.json has no
-                # top-level 'base_model', so resolve_dit_model needs it here to
-                # pick the --dit value (the torch path ignores --pretrained-name).
-                f"--pretrained-name {shlex.quote(base_model)} "
+                f"{pretrained_name_arg}"
                 f"--model-half "
                 f"--title {shlex.quote(title)}"
                 f"{default_prompt_arg}"

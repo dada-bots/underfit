@@ -71,6 +71,77 @@ def _metadata_fns(dataloader):
     return fns
 
 
+def _configure_fn(fn, dataset_config):
+    """Set prompt_config on a metadata fn's module globals. True if it took."""
+    g = getattr(fn, "__globals__", None)
+    if not g or "_prompt_config" not in g:
+        return False
+    setter = g.get("set_config")
+    if callable(setter):
+        # Call it for any side effects beyond the assignment.
+        try:
+            setter(dataset_config)
+        except Exception:
+            pass
+    # Then assign directly, and do not trust the setter to have done it. dill
+    # rebuilds each function with its own globals mapping, so after an unpickle
+    # set_config.__globals__ is NOT the same dict as get_custom_metadata.__globals__:
+    # the setter writes _prompt_config into a namespace the dataset never reads.
+    # Assigning here targets the mapping the metadata fn itself resolves against.
+    g["_prompt_config"] = dataset_config.get("prompt_config")
+    return g.get("_prompt_config") is not None
+
+
+def ensure_prompt_config(dataloader, dataset_config):
+    """Hand prompt_config to the metadata module the dataset will actually run.
+
+    The sa3 backend configures the module as it loads it. stable-audio-tools does
+    not: its factory runs its own spec_from_file_location + exec_module per dataset,
+    so the module it uses is a different object from anything underfit loaded and a
+    set_config() call on our copy never reaches it. That left every sat-backend run
+    on legacy tag prompts -- empty strings on clips with no tags, i.e. unconditional
+    training -- with everything configured in NEW FINETUNE silently discarded.
+
+    The fn is not stored as a function. SAT keeps it dill-pickled
+    (``custom_metadata_fns[path] = dill.dumps(fn)``) and dill.loads a fresh copy on
+    every __getitem__, so the pickle carries its own frozen snapshot of the module
+    globals. Mutating an unpickled copy changes nothing; the bytes have to be
+    re-dumped, which is what this does.
+
+    Returns the number of entries reconfigured.
+    """
+    if not isinstance(dataset_config, dict) or not dataset_config.get("prompt_config"):
+        return 0
+    ds = getattr(dataloader, "dataset", None)
+    if ds is None:
+        return 0
+    n = 0
+    store = getattr(ds, "custom_metadata_fns", None)
+    if isinstance(store, dict):
+        for key, raw in list(store.items()):
+            if isinstance(raw, (bytes, bytearray)):
+                try:
+                    import dill
+                    fn = dill.loads(raw)
+                    if _configure_fn(fn, dataset_config):
+                        store[key] = dill.dumps(fn)      # re-freeze, or it is lost
+                        n += 1
+                except Exception:
+                    continue
+            elif callable(raw) and _configure_fn(raw, dataset_config):
+                n += 1
+    for attr in ("custom_metadata_fn",):
+        fn = getattr(ds, attr, None)
+        if callable(fn) and _configure_fn(fn, dataset_config):
+            n += 1
+    for attr in ("configs", "datasets", "dataset_configs"):
+        for cfg in (getattr(ds, attr, None) or []):
+            fn = getattr(cfg, "custom_metadata_fn", None)
+            if callable(fn) and _configure_fn(fn, dataset_config):
+                n += 1
+    return n
+
+
 def diagnose_prompt_config(dataloader, dataset_config):
     """Return a warning string when prompt_config never reached the module."""
     if not isinstance(dataset_config, dict):

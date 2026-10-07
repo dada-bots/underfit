@@ -23,7 +23,7 @@ import torch
 from tqdm import tqdm
 
 from underfit.training.demo_step import run_demo_step
-from underfit.training.prompt_preview import print_prompt_preview
+from underfit.training.prompt_preview import print_prompt_preview, ensure_prompt_config
 from underfit.training.lora import apply_lora_from_config, load_lora_resume, save_lora_step
 from underfit.training.loss import compute_masked_loss, compute_normalized_mse
 from underfit.training.optim import create_optimizer_from_config, create_scheduler_from_config
@@ -389,6 +389,17 @@ def run_training(args, backend):
         pin_memory=_pin_memory,
         persistent_workers=_persistent,
     )
+
+    # stable-audio-tools loads the metadata module itself, so prompt_config has
+    # not reached it yet. Do that before the preview — the preview iterates the
+    # dataloader, which is when workers snapshot the module globals.
+    try:
+        _configured = ensure_prompt_config(train_dl, dataset_config)
+        if _configured:
+            print(f"[prompts] applied prompt_config to {_configured} metadata "
+                  f"module(s)", flush=True)
+    except Exception as e:
+        print(f"[prompts] could not apply prompt_config: {type(e).__name__}: {e}", flush=True)
 
     # Show what the conditioner will actually be fed, on every start and resume.
     # Sampled through the dataset the loop is about to consume, so a broken

@@ -91,6 +91,7 @@ def _resolve(s):
 # Defaults to MODELS_DIR/<key>/ unless the JSON overrides via paths.pre_encode_dir.
 MODEL_PATHS = {}
 MODEL_BASE_PATHS = {}   # key -> (base_config, base_ckpt) from the registry
+MODEL_BACKENDS  = {}   # key -> 'sa3' | 'sat', as the registry declares
 MODELS = {}
 _registry_paths = []
 for _root in (_MODELS_SHIPPED_DIR, *_EXTRA_MODELS_DIRS):
@@ -106,6 +107,8 @@ for _registry_path in _registry_paths:
     # The registry already names the exact config + checkpoint. Keep them: the
     # <dir>/base/model_config.json layout guessed below only matches models laid
     # out like the HF releases, not ones whose weights sit elsewhere.
+    _bks = _m.get("backends") or ([_m["backend"]] if _m.get("backend") else [])
+    MODEL_BACKENDS[_key] = (_bks[0] if _bks else None)
     _bc = _m.get("paths", {}).get("base_config")
     _bk = _m.get("paths", {}).get("base_ckpt")
     MODEL_BASE_PATHS[_key] = (Path(_resolve(_bc)) if _bc else None,
@@ -300,15 +303,20 @@ def _expand_files_to_tasks(audio_files, input_dir):
     return tasks
 
 
-def _build_pretransform(pretransform_config, sample_rate):
-    """Build a pretransform via the active backend (sa3 or sat).
+def _build_pretransform(pretransform_config, sample_rate, backend_name=None):
+    """Build a pretransform via the backend the MODEL declares.
 
-    The backend module owns the construction logic — sat has to work
-    around a brittle autoencoders→diffusion import; sa3 just delegates to its
-    factory. Picked via UNDERFIT_BACKEND env var or auto-detect.
+    The backend module owns the construction logic — sat has to work around a
+    brittle autoencoders→diffusion import; sa3 just delegates to its factory.
+
+    `backend_name` comes from the model's registry. Falling back to the ambient
+    UNDERFIT_BACKEND / auto-detect picks whichever library happens to be
+    importable, which is wrong whenever the two disagree: an Oobleck autoencoder
+    handed to sa3's factory is read as a SAME encoder and dies with an
+    IndexError deep inside the layer construction, nowhere near the real cause.
     """
     from underfit.backends import get_backend
-    backend = get_backend()
+    backend = get_backend(backend_name) if backend_name else get_backend()
     return backend.build_pretransform(pretransform_config, sample_rate)
 
 
@@ -344,7 +352,8 @@ def _encode_shard_inner(rank, world_size, cfg):
     # segfaults with certain package versions.  pre_encode only needs the
     # encoder/decoder, not the full diffusion model.
     print(f"[shard {rank}] creating pretransform...", file=sys.stderr, flush=True)
-    pretransform = _build_pretransform(cfg["pretransform_config"], cfg["sample_rate"])
+    pretransform = _build_pretransform(cfg["pretransform_config"], cfg["sample_rate"],
+                                       cfg.get("backend_name"))
     print(f"[shard {rank}] pretransform created, loading weights...", file=sys.stderr, flush=True)
 
     pt_sd = torch.load(cfg["weights_path"], map_location=device, weights_only=True)
@@ -792,6 +801,7 @@ def main():
         "latent_root":        str(latent_root),
         "weights_path":       str(weights_path),
         "pretransform_config": pretransform_config,
+        "backend_name":       MODEL_BACKENDS.get(model_name),
         "sample_rate":        sample_rate,
         "audio_channels":     audio_channels,
         "ds_ratio":           ds_ratio,

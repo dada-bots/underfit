@@ -57,6 +57,16 @@ _REPO_ROOT = Path(__file__).parent.parent
 _DASHBOARD_DIR = _REPO_ROOT / "dashboard"
 _MODELS_SHIPPED_DIR = _DASHBOARD_DIR / "models"  # per-model {registry.json, training_template.json}
 
+# Additional model-registry roots outside the repo, colon-separated like PATH.
+# Must match the dashboard's UNDERFIT_EXTRA_MODELS_DIR: a model registered only
+# there was offered in the dataset UI but rejected here by argparse, because this
+# script walks the registry itself rather than asking the dashboard.
+_EXTRA_MODELS_DIRS = [
+    Path(p).expanduser()
+    for p in os.environ.get("UNDERFIT_EXTRA_MODELS_DIR", "").split(os.pathsep)
+    if p.strip()
+]
+
 # Per-instance state — defaults to <repo>/state/.
 _STATE_DIR = Path(os.environ.get("UNDERFIT_STATE_DIR", _REPO_ROOT / "state")).expanduser()
 
@@ -80,14 +90,26 @@ def _resolve(s):
 # MODEL_PATHS[key] -> Path to the per-model dir containing config + ckpt symlinks.
 # Defaults to MODELS_DIR/<key>/ unless the JSON overrides via paths.pre_encode_dir.
 MODEL_PATHS = {}
+MODEL_BASE_PATHS = {}   # key -> (base_config, base_ckpt) from the registry
 MODELS = {}
-for _registry_path in sorted(_MODELS_SHIPPED_DIR.glob("*/registry.json")):
+_registry_paths = []
+for _root in (_MODELS_SHIPPED_DIR, *_EXTRA_MODELS_DIRS):
+    if _root.is_dir():
+        _registry_paths.extend(sorted(_root.glob("*/registry.json")))
+for _registry_path in _registry_paths:
     with open(_registry_path) as _f:
         _m = _json.load(_f)
     _key = _m["key"]
     MODELS[_key] = _m.get("description", "")
     _ped = _m.get("paths", {}).get("pre_encode_dir")
     MODEL_PATHS[_key] = Path(_resolve(_ped)) if _ped else (_MODELS_DIR / _key)
+    # The registry already names the exact config + checkpoint. Keep them: the
+    # <dir>/base/model_config.json layout guessed below only matches models laid
+    # out like the HF releases, not ones whose weights sit elsewhere.
+    _bc = _m.get("paths", {}).get("base_config")
+    _bk = _m.get("paths", {}).get("base_ckpt")
+    MODEL_BASE_PATHS[_key] = (Path(_resolve(_bc)) if _bc else None,
+                              Path(_resolve(_bk)) if _bk else None)
 
 MODEL_NAMES = list(MODELS.keys())
 
@@ -641,13 +663,20 @@ def main():
     # --- Read config (no model instantiation yet) -----------------------------
 
     model_dir   = MODEL_PATHS.get(model_name, _MODELS_DIR / model_name)
-    # Use the proper-named files directly under base/. The 'config' / 'ckpt'
-    # flat-symlinks in model_dir/ go through one extra hop (to base/...), and
-    # calling .resolve() on either now walks all the way to the HF cache's
-    # content-addressed blob (no extension!) which breaks load_ckpt_state_dict's
-    # if-endswith-.safetensors branch.
-    config_path = model_dir / "base" / "model_config.json"
-    ckpt_path   = model_dir / "base" / "model.safetensors"
+    # Prefer the paths the model's registry declares. The <dir>/base/... layout
+    # below is the HF release shape and holds only for the shipped models; a model
+    # whose weights live elsewhere (private, or a local checkpoint) names its own
+    # config and ckpt, and guessing instead produced a FileNotFoundError on a path
+    # that was never going to exist.
+    #
+    # Passing a flat 'config'/'ckpt' symlink is fine: load_ckpt_state_dict detects
+    # the format from the file header, so an extensionless target still loads.
+    _reg_cfg, _reg_ckpt = MODEL_BASE_PATHS.get(model_name, (None, None))
+    if _reg_cfg and _reg_cfg.exists() and _reg_ckpt and _reg_ckpt.exists():
+        config_path, ckpt_path = _reg_cfg, _reg_ckpt
+    else:
+        config_path = model_dir / "base" / "model_config.json"
+        ckpt_path   = model_dir / "base" / "model.safetensors"
 
     with open(config_path) as f:
         config = json.load(f)

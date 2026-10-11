@@ -3,6 +3,7 @@
 Adapter-agnostic: takes a backend module so the same code path works for
 both sat and sa3.
 """
+import inspect
 from functools import partial
 from pathlib import Path
 
@@ -88,7 +89,7 @@ def apply_lora_from_config(backend, model, lora_config, lora_state_dict=None,
 
 
 def save_lora_step(backend, model, lora_save_config, out_path,
-                   *, step=None, epoch=None, base_model=None):
+                   *, step=None, epoch=None, base_model=None, norm_base=None):
     """Save LoRA weights to out_path as a .safetensors file with config metadata.
 
     `step` and `epoch` are folded into the saved metadata (under the "step"
@@ -98,6 +99,11 @@ def save_lora_step(backend, model, lora_save_config, out_path,
     `base_model` (e.g. "sa3-medium") goes into metadata too — used by the
     dashboard's "Start from a previous LoRA" upload flow to verify the seed
     is shape-compatible with the user's selected base model.
+
+    `norm_base` identifies the weights the baked dora row norms were taken
+    against, for backends that bake them. Separate from `base_model` because
+    that one is a dashboard label and is often absent, while the norms are only
+    meaningful against one specific W0.
     """
     lora_mod = backend.lora_module()
     state_dict = {
@@ -112,7 +118,31 @@ def save_lora_step(backend, model, lora_save_config, out_path,
     if base_model:
         enriched_cfg["base_model"] = str(base_model)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    lora_mod.save_lora_safetensors(state_dict, enriched_cfg, out_path)
+    lora_mod.save_lora_safetensors(state_dict, enriched_cfg, out_path,
+                                   **_bake_kwargs(lora_mod, model,
+                                                  norm_base or base_model))
+
+
+def _bake_kwargs(lora_mod, model, norm_base):
+    """`model=` makes save_lora_safetensors bake each dora-rows layer's
+    ||W0 + s*BA||_row into the file, so a loader does not have to pull the base weights
+    back in just to take that norm. Only the sa3 backend accepts it, and only on
+    versions new enough to have it, so this stays feature-detected rather than
+    assumed -- an older stable-audio-tools would raise TypeError on the kwarg and
+    lose the checkpoint at the one moment it cannot be recomputed.
+    """
+    try:
+        params = inspect.signature(lora_mod.save_lora_safetensors).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "model" not in params:
+        return {}
+    kwargs = {"model": [model.model, model.conditioner]}
+    if "norm_base" in params and norm_base:
+        # Which W0 the norms belong to. base and arc reconstruct each other's norms
+        # closely enough that nothing raises, so record the pairing.
+        kwargs["norm_base"] = str(norm_base)
+    return kwargs
 
 
 def load_lora_resume(backend, ckpt_path):
